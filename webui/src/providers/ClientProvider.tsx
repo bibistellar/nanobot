@@ -6,6 +6,8 @@ interface ClientContextValue {
   client: NanobotClient;
   token: string;
   modelName: string | null;
+  baseUrl: string;
+  onDisconnect: () => void;
 }
 
 const ClientContext = createContext<ClientContextValue | null>(null);
@@ -14,15 +16,19 @@ export function ClientProvider({
   client,
   token,
   modelName = null,
+  baseUrl = "",
+  onDisconnect,
   children,
 }: {
   client: NanobotClient;
   token: string;
   modelName?: string | null;
+  baseUrl?: string;
+  onDisconnect: () => void;
   children: ReactNode;
 }) {
   return (
-    <ClientContext.Provider value={{ client, token, modelName }}>
+    <ClientContext.Provider value={{ client, token, modelName, baseUrl, onDisconnect }}>
       {children}
     </ClientContext.Provider>
   );

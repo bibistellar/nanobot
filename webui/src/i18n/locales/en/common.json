@@ -103,6 +103,19 @@
   "common": {
     "dismiss": "Dismiss"
   },
+  "setup": {
+    "title": "Connect to nanobot",
+    "description": "Enter your nanobot gateway address to get started.",
+    "serverPlaceholder": "http://192.168.1.100:8765",
+    "secretPlaceholder": "Secret",
+    "connect": "Connect",
+    "connecting": "Connecting…",
+    "hint": "Start the gateway with `nanobot gateway` and enter its address above.",
+    "error": {
+      "emptyServer": "Server address is required.",
+      "emptySecret": "Secret is required for remote connections."
+    }
+  },
   "errors": {
     "messageTooBig": {
       "title": "Message too large",

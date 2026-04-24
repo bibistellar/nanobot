@@ -103,6 +103,19 @@
   "common": {
     "dismiss": "关闭"
   },
+  "setup": {
+    "title": "连接到 nanobot",
+    "description": "输入你的 nanobot 网关地址即可开始使用。",
+    "serverPlaceholder": "http://192.168.1.100:8765",
+    "secretPlaceholder": "Secret",
+    "connect": "连接",
+    "connecting": "连接中…",
+    "hint": "启动网关：`nanobot gateway`，然后在上方输入地址。",
+    "error": {
+      "emptyServer": "请输入服务器地址。",
+      "emptySecret": "远程连接需要填写 Secret。"
+    }
+  },
   "errors": {
     "messageTooBig": {
       "title": "消息过大",

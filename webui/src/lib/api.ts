@@ -20,7 +20,6 @@ async function request<T>(
       ...(init?.headers ?? {}),
       Authorization: `Bearer ${token}`,
     },
-    credentials: "same-origin",
   });
   if (!res.ok) {
     throw new ApiError(res.status, `HTTP ${res.status}`);

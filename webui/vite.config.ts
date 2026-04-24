@@ -6,9 +6,12 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const target = env.NANOBOT_API_URL ?? "http://127.0.0.1:8765";
   const wsTarget = target.replace(/^http/, "ws");
+  // GitHub Pages base: repo name for project sites, "/" for user sites or local dev.
+  const base = env.VITE_BASE ?? "/";
 
   return {
     plugins: [react()],
+    base,
     resolve: {
       alias: {
         "@": path.resolve(__dirname, "./src"),
@@ -22,7 +25,7 @@ export default defineConfig(({ mode }) => {
       exclude: ["@radix-ui/react-dialog"],
     },
     build: {
-      outDir: path.resolve(__dirname, "../nanobot/web/dist"),
+      outDir: path.resolve(__dirname, env.VITE_BUILD_OUTDIR ?? "../nanobot/web/dist"),
       emptyOutDir: true,
       sourcemap: false,
     },

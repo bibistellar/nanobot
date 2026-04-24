@@ -8,20 +8,29 @@ import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { preloadMarkdownText } from "@/components/MarkdownText";
 import { useSessions } from "@/hooks/useSessions";
 import { useTheme } from "@/hooks/useTheme";
-import { cn } from "@/lib/utils";
-import { deriveWsUrl, fetchBootstrap } from "@/lib/bootstrap";
+import { cn, asset } from "@/lib/utils";
+import {
+  deriveWsUrl,
+  fetchBootstrap,
+  loadConnectionSettings,
+  saveConnectionSettings,
+  clearConnectionSettings,
+  isSameOrigin,
+} from "@/lib/bootstrap";
 import { NanobotClient } from "@/lib/nanobot-client";
 import { ClientProvider } from "@/providers/ClientProvider";
 import type { ChatSummary } from "@/lib/types";
 
 type BootState =
   | { status: "loading" }
+  | { status: "setup" }
   | { status: "error"; message: string }
   | {
       status: "ready";
       client: NanobotClient;
       token: string;
       modelName: string | null;
+      baseUrl: string;
     };
 
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
@@ -39,40 +48,87 @@ function readSidebarOpen(): boolean {
   }
 }
 
+/** Attempt bootstrap with the given server URL. Returns a ready BootState on success. */
+async function doBootstrap(
+  baseUrl: string,
+  secret: string = "",
+): Promise<{
+  client: NanobotClient;
+  token: string;
+  modelName: string | null;
+}> {
+  const boot = await fetchBootstrap(baseUrl, secret);
+  const url = deriveWsUrl(boot.ws_path, boot.token, baseUrl);
+  const client = new NanobotClient({
+    url,
+    onReauth: async () => {
+      try {
+        const refreshed = await fetchBootstrap(baseUrl, secret);
+        return deriveWsUrl(refreshed.ws_path, refreshed.token, baseUrl);
+      } catch {
+        return null;
+      }
+    },
+  });
+  client.connect();
+  return {
+    client,
+    token: boot.token,
+    modelName: boot.model_name ?? null,
+  };
+}
+
 export default function App() {
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
+  const [setupServer, setSetupServer] = useState("");
+  const [setupSecret, setSetupSecret] = useState("");
+  const [setupError, setSetupError] = useState("");
+  const [setupSubmitting, setSetupSubmitting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
+
     (async () => {
-      try {
-        const boot = await fetchBootstrap();
-        if (cancelled) return;
-        const url = deriveWsUrl(boot.ws_path, boot.token);
-        const client = new NanobotClient({
-          url,
-          onReauth: async () => {
-            try {
-              const refreshed = await fetchBootstrap();
-              return deriveWsUrl(refreshed.ws_path, refreshed.token);
-            } catch {
-              return null;
-            }
-          },
-        });
-        client.connect();
-        setState({
-          status: "ready",
-          client,
-          token: boot.token,
-          modelName: boot.model_name ?? null,
-        });
-      } catch (e) {
-        if (cancelled) return;
-        setState({ status: "error", message: (e as Error).message });
+      // 1. Try same-origin (gateway-served) mode first.
+      if (isSameOrigin()) {
+        try {
+          const result = await doBootstrap("");
+          if (cancelled) {
+            result.client.close();
+            return;
+          }
+          setState({ status: "ready", ...result, baseUrl: "" });
+          return;
+        } catch {
+          // Same-origin failed, fall through to remote mode.
+        }
+      }
+
+      // 2. Try cached remote settings.
+      const cached = loadConnectionSettings();
+      if (cached) {
+        setSetupServer(cached.server);
+        setSetupSecret(cached.secret);
+        try {
+          const result = await doBootstrap(cached.server, cached.secret);
+          if (cancelled) {
+            result.client.close();
+            return;
+          }
+          setState({ status: "ready", ...result, baseUrl: cached.server });
+          return;
+        } catch {
+          // Cached settings invalid, show setup form with pre-filled values.
+        }
+      }
+
+      // 3. Show connection setup form.
+      if (!cancelled) {
+        setState({ status: "setup" });
       }
     })();
+
     return () => {
       cancelled = true;
     };
@@ -95,12 +151,47 @@ export default function App() {
     return () => globalThis.clearTimeout(id);
   }, []);
 
+  const handleSetupSubmit = useCallback(async () => {
+    setSetupError("");
+    const server = setupServer.replace(/\/+$/, "");
+    if (!server) {
+      setSetupError(t("setup.error.emptyServer"));
+      return;
+    }
+    const isLocal =
+      server.includes("localhost") ||
+      server.includes("127.0.0.1") ||
+      server.includes("[::1]");
+    if (!isLocal && !setupSecret.trim()) {
+      setSetupError(t("setup.error.emptySecret"));
+      return;
+    }
+    setSetupSubmitting(true);
+    try {
+      const result = await doBootstrap(server, setupSecret);
+      saveConnectionSettings({ server, secret: setupSecret });
+      setState({ status: "ready", ...result, baseUrl: server });
+    } catch (e) {
+      setSetupError((e as Error).message);
+    } finally {
+      setSetupSubmitting(false);
+    }
+  }, [setupServer, setupSecret, t]);
+
+  const handleDisconnect = useCallback(() => {
+    if (state.status === "ready") {
+      state.client.close();
+    }
+    clearConnectionSettings();
+    setState({ status: "setup" });
+  }, [state]);
+
   if (state.status === "loading") {
     return (
       <div className="flex h-full w-full items-center justify-center">
         <div className="flex flex-col items-center gap-3 animate-in fade-in-0 duration-300">
           <img
-            src="/brand/nanobot_icon.png"
+            src={asset("brand/nanobot_icon.png")}
             alt=""
             className="h-10 w-10 animate-pulse select-none"
             aria-hidden
@@ -117,12 +208,71 @@ export default function App() {
       </div>
     );
   }
+
+  if (state.status === "setup") {
+    return (
+      <div className="flex h-full w-full items-center justify-center px-4">
+        <div className="flex w-full max-w-sm flex-col items-center gap-6">
+          <img
+            src={asset("brand/nanobot_icon.png")}
+            alt=""
+            className="h-12 w-12 select-none"
+            aria-hidden
+            draggable={false}
+          />
+          <div className="flex flex-col gap-1 text-center">
+            <p className="text-lg font-semibold">{t("setup.title")}</p>
+            <p className="text-sm text-muted-foreground">
+              {t("setup.description")}
+            </p>
+          </div>
+          <form
+            className="flex w-full flex-col gap-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void handleSetupSubmit();
+            }}
+          >
+            <input
+              type="url"
+              value={setupServer}
+              onChange={(e) => setSetupServer(e.target.value)}
+              placeholder={t("setup.serverPlaceholder")}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              autoFocus
+            />
+            <input
+              type="password"
+              value={setupSecret}
+              onChange={(e) => setSetupSecret(e.target.value)}
+              placeholder={t("setup.secretPlaceholder")}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+            {setupError && (
+              <p className="text-sm text-destructive">{setupError}</p>
+            )}
+            <button
+              type="submit"
+              disabled={setupSubmitting}
+              className="inline-flex h-10 w-full items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:pointer-events-none"
+            >
+              {setupSubmitting ? t("setup.connecting") : t("setup.connect")}
+            </button>
+          </form>
+          <p className="text-xs text-muted-foreground text-center">
+            {t("setup.hint")}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   if (state.status === "error") {
     return (
       <div className="flex h-full w-full items-center justify-center px-4 text-center">
         <div className="flex max-w-md flex-col items-center gap-3">
           <img
-            src="/brand/nanobot_icon.png"
+            src={asset("brand/nanobot_icon.png")}
             alt=""
             className="h-10 w-10 opacity-60 grayscale select-none"
             aria-hidden
@@ -133,6 +283,12 @@ export default function App() {
           <p className="text-xs text-muted-foreground">
             {t("app.error.gatewayHint")}
           </p>
+          <button
+            onClick={() => setState({ status: "setup" })}
+            className="mt-2 inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+          >
+            {t("setup.title")}
+          </button>
         </div>
       </div>
     );
@@ -149,6 +305,8 @@ export default function App() {
       client={state.client}
       token={state.token}
       modelName={state.modelName}
+      baseUrl={state.baseUrl}
+      onDisconnect={handleDisconnect}
     >
       <Shell onModelNameChange={handleModelNameChange} />
     </ClientProvider>

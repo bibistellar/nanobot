@@ -39,8 +39,9 @@ class HandoffTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "You are done with this step. Pass control to the next step. "
-            "You MUST call this (or complete()) before your tool budget runs out."
+            "REQUIRED after finishing your work in this step. "
+            "Pass your progress summary to the next step. "
+            "Use complete() instead if the entire goal is achieved."
         )
 
     async def execute(self, message: str, **kwargs: Any) -> str:
@@ -87,15 +88,16 @@ _STEP_BUDGET = 8
 _BUDGET_EXHAUSTED_PREFIX = "Tool budget exhausted"
 
 _LONG_TASK_SYSTEM_PROMPT = """\
-You are one step in a chain. Do a small chunk of work, then call handoff().
+You are one step in a chain working toward a goal.
 
-1. Check the filesystem to see what's already done (ignore handoff notes).
-2. Do the next small piece of work.
-3. Call handoff() with what you did and where results are saved. \
-If everything is truly done, call complete() instead.
+1. Check the filesystem to see what's already done.
+2. Do the next piece of work. Write results to files as you go — \
+do NOT just collect information without producing output.
+3. When done with your chunk, call handoff() with a brief summary. \
+If the entire goal is finished, call complete() instead.
 
-You have very few tool calls. Do NOT try to finish everything. \
-Do one chunk, call handoff(), done.
+IMPORTANT: Write output to files early and often. If you run out of \
+tool calls, only what's on the filesystem survives.
 """
 
 
@@ -104,8 +106,7 @@ def _build_user_message(goal: str, step: int, handoff: str) -> str:
     budget_note = (
         f"\n\n---\n"
         f"Step {step + 1}. You have {_STEP_BUDGET} tool calls total. "
-        f"Reserve the last 1-2 calls for handoff() or complete(). "
-        f"If you run out of calls without calling one, your progress is LOST."
+        f"Call handoff() or complete() before you run out."
     )
     if step == 0:
         return goal + budget_note
@@ -168,6 +169,7 @@ class LongTaskTool(Tool):
 
     async def execute(self, goal: str, max_steps: int = 20, **kwargs: Any) -> str:
         handoff = ""
+        logger.debug("long_task start: max_steps={}, goal={:.120}", max_steps, goal)
         for step in range(max_steps):
             signal_store: dict[str, str] = {}
             user_msg = _build_user_message(goal, step, handoff)
@@ -186,19 +188,39 @@ class LongTaskTool(Tool):
                     )
                 return f"Long task failed at step {step + 1}/{max_steps}."
             sig_type = signal_store.get("type")
+            sig_payload = signal_store.get("payload", "")
             logger.info(
                 "long_task step {}/{}: signal={}, stop_reason={}, tools={}",
-                step + 1, max_steps, sig_type or "none",
+                step + 1, max_steps, sig_type or "auto",
                 result.stop_reason,
                 result.tools_used,
             )
             if sig_type == "complete":
-                return signal_store["payload"]
-            elif sig_type == "handoff":
-                handoff = signal_store["payload"]
+                logger.debug(
+                    "long_task done at step {}: complete payload={:.200}",
+                    step + 1, sig_payload,
+                )
+                return sig_payload
+
+            # Auto-extract progress — don't require handoff()
+            if sig_type == "handoff":
+                handoff = sig_payload
+                logger.debug("long_task step {} handoff: {:.200}", step + 1, handoff)
+            elif result.stop_reason == "completed":
+                # Subagent returned text naturally (no more tool calls)
+                handoff = result.final_content or ""
+                logger.debug(
+                    "long_task step {} natural end: {:.200}",
+                    step + 1, handoff[:200] if handoff else "(empty)",
+                )
             else:
-                # No signal tool called — extract useful content as fallback
+                # max_iterations hit — extract whatever text the subagent produced
                 handoff = _extract_handoff_from_messages(result.messages)
+                logger.debug(
+                    "long_task step {} auto-extract: {:.200}",
+                    step + 1, handoff[:200] if handoff else "(empty)",
+                )
+        logger.warning("long_task exhausted max_steps={}", max_steps)
         return (
             f"Long task reached max steps ({max_steps}). "
             f"Last progress:\n{handoff}"

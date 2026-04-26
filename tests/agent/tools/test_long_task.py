@@ -159,6 +159,38 @@ async def test_long_task_fallback_when_no_signal_called():
 
 
 @pytest.mark.asyncio
+async def test_long_task_auto_extracts_on_natural_end():
+    """Subagent finishes naturally (stop_reason=completed) without calling signal."""
+    from nanobot.agent.tools.long_task import LongTaskTool
+
+    mgr = _make_manager_stub()
+    steps = 0
+
+    async def fake_run_step(*, system_prompt, user_message, extra_tools):
+        nonlocal steps
+        steps += 1
+        if steps == 1:
+            return _step_result(
+                final_content="I processed items 1-5. Results in out.md.",
+                stop_reason="completed",
+            )
+        # Second step: subagent calls complete
+        for t in extra_tools:
+            if t.name == "complete":
+                await t.execute(summary="All done.")
+        return _step_result(
+            final_content="All done.",
+            tools_used=["complete"],
+        )
+
+    mgr.run_step.side_effect = fake_run_step
+    tool = LongTaskTool(manager=mgr)
+    result = await tool.execute(goal="Process items.", max_steps=5)
+    assert "All done." == result
+    assert steps == 2
+
+
+@pytest.mark.asyncio
 async def test_long_task_goal_appears_in_system_prompt():
     """Verify every step's system_prompt contains the long task system prompt."""
     from nanobot.agent.tools.long_task import LongTaskTool

@@ -49,6 +49,8 @@ class ContextBuilder:
             parts.append(f"# Short-term Memory\n\n{memory}")
 
         # Long-term memory (Dashscope cloud)
+        import logging as _logging
+        _logging.getLogger(__name__).warning("Dashscope client: %s", self.dashscope)
         if self.dashscope:
             try:
                 ltm = self.dashscope.search_memory(

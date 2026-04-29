@@ -246,6 +246,8 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
+        import logging as _logging
+        _logging.getLogger(__name__).warning("AgentLoop init: dashscope_client=%s", dashscope_client)
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills,
                                       dashscope_client=dashscope_client)
         self.sessions = session_manager or SessionManager(workspace)

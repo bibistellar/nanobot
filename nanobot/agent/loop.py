@@ -209,10 +209,12 @@ class AgentLoop:
         tools_config: ToolsConfig | None = None,
         provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
+        dashscope_client: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
         _tc = tools_config or ToolsConfig()
+        self._dashscope_client = dashscope_client
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
@@ -244,7 +246,8 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills,
+                                      dashscope_client=dashscope_client)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
@@ -298,6 +301,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            dashscope_client=dashscope_client,
         )
         self._register_default_tools()
         if _tc.my.enable:

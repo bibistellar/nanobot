@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.dashscope_memory import DashscopeMemoryClient
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime, truncate_text
 from nanobot.utils.prompt_templates import render_template
@@ -22,10 +23,12 @@ class ContextBuilder:
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
+    def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None,
+                 dashscope_client: DashscopeMemoryClient | None = None):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
+        self.dashscope = dashscope_client
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -40,9 +43,22 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
+        # Short-term memory (local MEMORY.md)
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Memory\n\n{memory}")
+            parts.append(f"# Short-term Memory\n\n{memory}")
+
+        # Long-term memory (Dashscope cloud)
+        if self.dashscope:
+            try:
+                ltm = self.dashscope.search_memory(
+                    query="用户偏好、重要事实、项目上下文",
+                )
+                if ltm:
+                    parts.append(f"# Long-term Memory\n\n{ltm}")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Dashscope memory search failed: %s", e)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:

@@ -421,6 +421,15 @@ def _make_provider(config: Config):
         raise typer.Exit(1) from exc
 
 
+def _make_dashscope_client(config: Config):
+    """Create Dashscope memory client if configured."""
+    dc = config.dashscope_memory
+    if not dc.enable or not dc.api_key:
+        return None
+    from nanobot.agent.dashscope_memory import DashscopeMemoryClient
+    return DashscopeMemoryClient(api_key=dc.api_key, user_id=dc.user_id)
+
+
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
     from nanobot.config.loader import load_config, resolve_config_env_vars, set_config_path
@@ -519,6 +528,7 @@ def serve(
     session_manager = SessionManager(runtime_config.workspace_path)
     agent_loop = AgentLoop(
         bus=bus,
+        dashscope_client=_make_dashscope_client(runtime_config),
         provider=provider,
         workspace=runtime_config.workspace_path,
         model=runtime_config.agents.defaults.model,
@@ -632,6 +642,7 @@ def _run_gateway(
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
+        dashscope_client=_make_dashscope_client(config),
         provider=provider,
         workspace=config.workspace_path,
         model=provider_snapshot.model,
@@ -1026,6 +1037,7 @@ def agent(
 
     agent_loop = AgentLoop(
         bus=bus,
+        dashscope_client=_make_dashscope_client(config),
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,

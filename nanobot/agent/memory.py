@@ -729,6 +729,7 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        dashscope_client: Any | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -740,6 +741,7 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        self.dashscope = dashscope_client
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -999,5 +1001,19 @@ class Dream:
             sha = self.store.git.auto_commit(commit_msg)
             if sha:
                 logger.info("Dream commit: {}", sha)
+
+        # Sync to Dashscope long-term memory (short-term → long-term consolidation)
+        if self.dashscope and batch:
+            try:
+                messages = []
+                for entry in batch:
+                    content = entry.get("content", "")
+                    if content:
+                        messages.append({"role": "user", "content": content})
+                if messages:
+                    self.dashscope.add_memory(messages)
+                    logger.info("Dream: synced {} entries to Dashscope long-term memory", len(messages))
+            except Exception as e:
+                logger.warning("Dream: Dashscope sync failed: {}", e)
 
         return True

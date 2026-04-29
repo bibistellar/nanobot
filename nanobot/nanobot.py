@@ -66,8 +66,15 @@ class Nanobot:
         bus = MessageBus()
         defaults = config.agents.defaults
 
+        dashscope_client = None
+        dc = config.dashscope_memory
+        if dc.enable and dc.api_key:
+            from nanobot.agent.dashscope_memory import DashscopeMemoryClient
+            dashscope_client = DashscopeMemoryClient(api_key=dc.api_key, user_id=dc.user_id)
+
         loop = AgentLoop(
             bus=bus,
+            dashscope_client=dashscope_client,
             provider=provider,
             workspace=config.workspace_path,
             model=defaults.model,

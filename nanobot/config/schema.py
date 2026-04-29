@@ -104,6 +104,14 @@ class AgentDefaults(Base):
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
+class DashscopeMemoryConfig(Base):
+    """Aliyun Dashscope long-term memory configuration."""
+
+    enable: bool = False
+    api_key: str = ""
+    user_id: str = "nanobot_default"
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
@@ -254,6 +262,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    dashscope_memory: DashscopeMemoryConfig = Field(default_factory=DashscopeMemoryConfig)
 
     @property
     def workspace_path(self) -> Path:

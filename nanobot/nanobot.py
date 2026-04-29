@@ -75,6 +75,7 @@ class Nanobot:
         loop = AgentLoop(
             bus=bus,
             dashscope_client=dashscope_client,
+            system_to_user_models=defaults.system_to_user_models,
             provider=provider,
             workspace=config.workspace_path,
             model=defaults.model,

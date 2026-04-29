@@ -24,11 +24,13 @@ class ContextBuilder:
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None,
-                 dashscope_client: DashscopeMemoryClient | None = None):
+                 dashscope_client: DashscopeMemoryClient | None = None,
+                 system_to_user_models: list[str] | None = None):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.dashscope = dashscope_client
+        self.system_to_user_models = system_to_user_models or []
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -145,6 +147,10 @@ class ContextBuilder:
             pass
         return False
 
+    def _should_inject_system_to_user(self, model: str) -> bool:
+        """Check if the current model requires system prompt in user message."""
+        return any(model.startswith(prefix) for prefix in self.system_to_user_models)
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -155,22 +161,38 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         session_summary: str | None = None,
+        model: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, session_summary=session_summary)
         user_content = self._build_user_content(current_message, media)
+        system_prompt = self.build_system_prompt(skill_names, channel=channel)
+
+        # For models that go through proxies that strip system prompt (e.g. CLIProxyAPI OAuth),
+        # inject the system prompt into the user message instead.
+        inject_system = model and self._should_inject_system_to_user(model)
+
+        if inject_system:
+            system_prefix = f"[System Context]\n{system_prompt}\n[/System Context]\n\n"
+        else:
+            system_prefix = ""
 
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
+            merged = f"{system_prefix}{runtime_ctx}\n\n{user_content}"
         else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
-        messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
-            *history,
-        ]
-        if messages[-1].get("role") == current_role:
+            merged = [{"type": "text", "text": f"{system_prefix}{runtime_ctx}"}] + user_content
+
+        if inject_system:
+            messages = [*history]
+        else:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                *history,
+            ]
+
+        if messages and messages[-1].get("role") == current_role:
             last = dict(messages[-1])
             last["content"] = self._merge_message_content(last.get("content"), merged)
             messages[-1] = last

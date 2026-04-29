@@ -529,6 +529,7 @@ def serve(
     agent_loop = AgentLoop(
         bus=bus,
         dashscope_client=_make_dashscope_client(runtime_config),
+        system_to_user_models=runtime_config.agents.defaults.system_to_user_models,
         provider=provider,
         workspace=runtime_config.workspace_path,
         model=runtime_config.agents.defaults.model,
@@ -643,6 +644,7 @@ def _run_gateway(
     agent = AgentLoop(
         bus=bus,
         dashscope_client=_make_dashscope_client(config),
+        system_to_user_models=config.agents.defaults.system_to_user_models,
         provider=provider,
         workspace=config.workspace_path,
         model=provider_snapshot.model,
@@ -1038,6 +1040,7 @@ def agent(
     agent_loop = AgentLoop(
         bus=bus,
         dashscope_client=_make_dashscope_client(config),
+        system_to_user_models=config.agents.defaults.system_to_user_models,
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,

@@ -102,6 +102,7 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    system_to_user_models: list[str] = Field(default_factory=list)  # Model name prefixes that require system prompt injected into user message (e.g. ["claude-"] for CLIProxyAPI OAuth)
 
 
 class DashscopeMemoryConfig(Base):

@@ -210,6 +210,7 @@ class AgentLoop:
         provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
         dashscope_client: Any | None = None,
+        system_to_user_models: list[str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -247,7 +248,8 @@ class AgentLoop:
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills,
-                                      dashscope_client=dashscope_client)
+                                      dashscope_client=dashscope_client,
+                                      system_to_user_models=system_to_user_models)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
@@ -917,6 +919,7 @@ class AgentLoop:
                 chat_id=chat_id,
                 session_summary=pending,
                 current_role=current_role,
+                model=self.model,
             )
             final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
@@ -1012,6 +1015,7 @@ class AgentLoop:
                 media=msg.media if msg.media else None,
                 channel=msg.channel,
                 chat_id=self._runtime_chat_id(msg),
+                model=self.model,
             )
 
         async def _bus_progress(

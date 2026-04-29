@@ -136,7 +136,6 @@ def _make_provider_for_model(
     reasoning_effort) override the active preset defaults.
     """
     from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.factory import make_provider
     from nanobot.providers.registry import find_by_name
 
     gen_src = preset or config.resolve_preset()

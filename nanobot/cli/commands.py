@@ -413,7 +413,6 @@ def _make_provider(config: Config):
     Routing is driven by ``ProviderSpec.backend`` in the registry.
     """
     from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.factory import make_provider
     from nanobot.providers.registry import find_by_name
 
     resolved = config.resolve_preset()

@@ -48,8 +48,17 @@ class ContextBuilder:
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Short-term Memory\n\n{memory}")
 
-        # Long-term memory is injected into user message (see build_messages)
-        # to avoid being overridden by CLIProxyAPI cloaking on system prompt.
+        # Long-term memory (Dashscope cloud)
+        if self.dashscope:
+            try:
+                ltm = self.dashscope.search_memory(
+                    query="用户偏好、重要事实、项目上下文",
+                )
+                if ltm:
+                    parts.append(f"# Long-term Memory\n\n{ltm}")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Dashscope memory search failed: %s", e)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -151,23 +160,10 @@ class ContextBuilder:
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, session_summary=session_summary)
         user_content = self._build_user_content(current_message, media)
 
-        # Inject long-term memory from Dashscope into user message prefix
-        # (avoids CLIProxyAPI cloaking which overrides system prompt)
-        ltm_prefix = ""
-        if self.dashscope:
-            try:
-                ltm = self.dashscope.search_memory(
-                    query="用户偏好、重要事实、项目上下文",
-                )
-                if ltm:
-                    ltm_prefix = f"[Long-term Memory]\n{ltm}\n[/Long-term Memory]\n\n"
-            except Exception:
-                pass
-
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
-            merged = f"{ltm_prefix}{runtime_ctx}\n\n{user_content}"
+            merged = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
         messages = [

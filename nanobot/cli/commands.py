@@ -412,73 +412,13 @@ def _make_provider(config: Config):
 
     Routing is driven by ``ProviderSpec.backend`` in the registry.
     """
-    from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.registry import find_by_name
+    from nanobot.providers.factory import make_provider
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-    spec = find_by_name(provider_name) if provider_name else None
-    backend = spec.backend if spec else "openai_compat"
-
-    # --- validation ---
-    if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
-        if needs_key and not exempt:
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
-            raise typer.Exit(1)
-
-    # --- instantiation by backend ---
-    if backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-
-        provider = OpenAICodexProvider(default_model=model)
-    elif backend == "azure_openai":
-        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
-
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    elif backend == "github_copilot":
-        from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
-        provider = GitHubCopilotProvider(default_model=model)
-    elif backend == "anthropic":
-        from nanobot.providers.anthropic_provider import AnthropicProvider
-
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
-        )
-
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
+    try:
+        return make_provider(config)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -598,6 +538,7 @@ def serve(
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=runtime_config.agents.defaults.consolidation_ratio,
+        max_messages=runtime_config.agents.defaults.max_messages,
         tools_config=runtime_config.tools,
     )
 
@@ -664,6 +605,7 @@ def _run_gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
     from nanobot.session.manager import SessionManager
 
     port = port if port is not None else config.gateway.port
@@ -671,7 +613,12 @@ def _run_gateway(
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
+    try:
+        provider_snapshot = build_provider_snapshot(config)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    provider = provider_snapshot.provider
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -687,9 +634,9 @@ def _run_gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=provider_snapshot.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
+        context_window_tokens=provider_snapshot.context_window_tokens,
         web_config=config.tools.web,
         context_block_limit=config.agents.defaults.context_block_limit,
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
@@ -705,7 +652,10 @@ def _run_gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
+        max_messages=config.agents.defaults.max_messages,
         tools_config=config.tools,
+        provider_snapshot_loader=load_provider_snapshot,
+        provider_signature=provider_snapshot.signature,
     )
 
     from nanobot.agent.loop import UNIFIED_SESSION_KEY
@@ -718,7 +668,9 @@ def _run_gateway(
             else f"{channel}:{chat_id}"
         )
 
-    async def _deliver_to_channel(msg: OutboundMessage, *, record: bool = False) -> None:
+    async def _deliver_to_channel(
+        msg: OutboundMessage, *, record: bool = False, session_key: str | None = None,
+    ) -> None:
         """Publish a user-visible message and mirror it into that channel's session."""
         metadata = dict(msg.metadata or {})
         record = record or bool(metadata.pop("_record_channel_delivery", False))
@@ -739,7 +691,8 @@ def _run_gateway(
             and hasattr(session_manager, "get_or_create")
             and hasattr(session_manager, "save")
         ):
-            session = session_manager.get_or_create(_channel_session_key(msg.channel, msg.chat_id))
+            key = session_key or _channel_session_key(msg.channel, msg.chat_id)
+            session = session_manager.get_or_create(key)
             session.add_message("assistant", msg.content, _channel_delivery=True)
             session_manager.save(session)
         await bus.publish_outbound(msg)
@@ -763,9 +716,11 @@ def _run_gateway(
         from nanobot.utils.evaluator import evaluate_response
 
         reminder_note = (
-            "[Scheduled Task] Timer finished.\n\n"
-            f"Task '{job.name}' has been triggered.\n"
-            f"Scheduled instruction: {job.payload.message}"
+            "The scheduled time has arrived. Deliver this reminder to the user now, "
+            "as a brief and natural message in their language. Speak directly to them — "
+            "do not narrate progress, summarize, include user IDs, or add status reports "
+            "like 'Done' or 'Reminded'.\n\n"
+            f"Reminder: {job.payload.message}"
         )
 
         cron_tool = agent.tools.get("cron")
@@ -809,8 +764,10 @@ def _run_gateway(
                         channel=job.payload.channel or "cli",
                         chat_id=job.payload.to,
                         content=response,
+                        metadata=dict(job.payload.channel_meta),
                     ),
                     record=True,
+                    session_key=job.payload.session_key,
                 )
         return response
 
@@ -837,6 +794,14 @@ def _run_gateway(
         return "cli", "direct"
 
     # Create heartbeat service
+    heartbeat_preamble = (
+        "[Your response will be delivered directly to the user's messaging app. "
+        "Output ONLY the final user-facing message. Never reference internal "
+        "files (HEARTBEAT.md, AWARENESS.md, etc.), your instructions, or your "
+        "decision process. If nothing needs reporting, respond with just "
+        "'All clear.' and nothing else.]\n\n"
+    )
+
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
@@ -845,7 +810,7 @@ def _run_gateway(
             pass
 
         resp = await agent.process_direct(
-            tasks,
+            heartbeat_preamble + tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
@@ -1080,6 +1045,7 @@ def agent(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
+        max_messages=config.agents.defaults.max_messages,
         tools_config=config.tools,
     )
     restart_notice = consume_restart_notice_from_env()

@@ -10,6 +10,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     apt-get purge -y gnupg && \
     apt-get autoremove -y && \
+    apt-get install -y --no-install-recommends openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

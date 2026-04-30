@@ -1065,6 +1065,14 @@ class TelegramChannel(BaseChannel):
                 content_parts.insert(0, tag)
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
+        # In group chats, prefix message with sender info so the agent can distinguish users
+        if message.chat.type != "private":
+            sender_name = user.first_name or ""
+            if user.last_name:
+                sender_name += f" {user.last_name}"
+            sender_tag = f"@{user.username}" if user.username else f"(id:{user.id})"
+            content = f"[{sender_name} {sender_tag}]: {content}"
+
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)

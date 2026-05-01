@@ -69,14 +69,14 @@ class ContextBuilder:
         # Long-term memory (Dashscope cloud)
         if self.dashscope:
             try:
-                ltm = self.dashscope.search_memory(
-                    query="用户偏好、重要事实、项目上下文",
-                )
-                if ltm:
-                    parts.append(f"# Long-term Memory\n\n{ltm}")
+                nodes = self.dashscope.list_memory()
+                if nodes:
+                    lines = [f"- {n.get('content', '')}" for n in nodes if n.get("content")]
+                    if lines:
+                        parts.append(f"# Long-term Memory\n\n" + "\n".join(lines))
             except Exception as e:
                 import logging
-                logging.getLogger(__name__).warning("Dashscope memory search failed: %s", e)
+                logging.getLogger(__name__).warning("Dashscope memory load failed: %s", e)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:

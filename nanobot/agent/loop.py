@@ -558,13 +558,17 @@ class AgentLoop:
             self._set_runtime_checkpoint(session, payload)
 
         async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
-            """Drain follow-up messages from the pending queue.
+            """Drain follow-up messages from the pending queue (non-blocking).
 
-            When no messages are immediately available but sub-agents
-            spawned in this dispatch are still running, blocks until at
-            least one result arrives (or timeout).  This keeps the runner
-            loop alive so subsequent sub-agent completions are consumed
-            in-order rather than dispatched separately.
+            Pulls whatever is currently sitting in the per-session pending
+            queue (mid-turn injections from the bus) up to ``limit``. Never
+            blocks: if the queue is empty, returns ``[]`` and the runner ends
+            the turn naturally.
+
+            Sub-agent results that arrive while the turn is still active flow
+            through this drain like any other injection. Results that arrive
+            after the turn has ended are processed as independent turns via
+            the system-channel dispatch path.
             """
             if pending_queue is None:
                 return []
@@ -593,28 +597,6 @@ class AgentLoop:
                     items.append(_to_user_message(pending_queue.get_nowait()))
                 except asyncio.QueueEmpty:
                     break
-
-            # Block if nothing drained but sub-agents spawned in this dispatch
-            # are still running.  Keeps the runner loop alive so subsequent
-            # completions are injected in-order rather than dispatched separately.
-            if (not items
-                    and session is not None
-                    and self.subagents.get_running_count_by_session(session.key) > 0):
-                try:
-                    msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Timeout waiting for sub-agent completion in session {}",
-                        session.key,
-                    )
-                    return items
-                items.append(_to_user_message(msg))
-                while len(items) < limit:
-                    try:
-                        items.append(_to_user_message(pending_queue.get_nowait()))
-                    except asyncio.QueueEmpty:
-                        break
-
             return items
 
         result = await self.runner.run(AgentRunSpec(

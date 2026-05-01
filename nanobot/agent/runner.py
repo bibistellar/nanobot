@@ -152,9 +152,16 @@ class AgentRunner:
         """Drain pending injections. Returns (should_continue, updated_cycles).
 
         If injections are found and we haven't exceeded _MAX_INJECTION_CYCLES,
-        append them to *messages* (and emit a checkpoint if *assistant_message*
-        and *iteration* are both provided) and return (True, cycles+1) so the
-        caller continues the iteration loop.  Otherwise return (False, cycles).
+        append them to *messages* and return (True, cycles+1) so the caller
+        continues the iteration loop. Otherwise return (False, cycles).
+
+        When ``assistant_message`` is provided (the natural-language
+        final-response branch), it represents a streamed but un-finalized draft.
+        We intentionally discard it instead of appending: keeping the draft in
+        ``messages`` would let the next iteration's LLM see its own un-delivered
+        content and repeat it. By dropping the draft, the next iteration sees a
+        clean user-only history plus the injection, and generates one unified
+        reply.
         """
         if injection_cycles >= _MAX_INJECTION_CYCLES:
             return False, injection_cycles
@@ -162,24 +169,14 @@ class AgentRunner:
         if not injections:
             return False, injection_cycles
         injection_cycles += 1
-        if assistant_message is not None:
-            messages.append(assistant_message)
-            if iteration is not None:
-                await self._emit_checkpoint(
-                    spec,
-                    {
-                        "phase": "final_response",
-                        "iteration": iteration,
-                        "model": spec.model,
-                        "assistant_message": assistant_message,
-                        "completed_tool_results": [],
-                        "pending_tool_calls": [],
-                    },
-                )
+        # ``assistant_message`` (if any) is dropped on purpose — see docstring.
+        # The "final_response" checkpoint is also skipped because the draft is
+        # no longer part of the turn we intend to persist.
         self._append_injected_messages(messages, injections)
         logger.info(
-            "Injected {} follow-up message(s) {} ({}/{})",
+            "Injected {} follow-up message(s) {} ({}/{}){}",
             len(injections), phase, injection_cycles, _MAX_INJECTION_CYCLES,
+            "; discarded assistant draft" if assistant_message is not None else "",
         )
         return True, injection_cycles
 

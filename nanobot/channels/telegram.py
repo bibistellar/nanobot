@@ -698,7 +698,13 @@ class TelegramChannel(BaseChannel):
                 except Exception:
                     # Fall back to _send_text which handles HTML→plain gracefully.
                     await self._send_text(int_chat_id, extra_html_chunk)
-            self._stream_bufs.pop(chat_id, None)
+            if meta.get("_resuming"):
+                # Keep message_id so the next stream segment edits the same
+                # Telegram message instead of creating a duplicate.
+                buf.text = ""
+                buf.stream_id = None  # accept any next stream_id
+            else:
+                self._stream_bufs.pop(chat_id, None)
             return
 
         buf = self._stream_bufs.get(chat_id)

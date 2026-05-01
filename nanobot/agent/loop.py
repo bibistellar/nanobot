@@ -908,17 +908,18 @@ class AgentLoop:
                 "include_timestamps": True,
             }
             history = session.get_history(**_hist_kwargs)
-            current_role = "assistant" if is_subagent else "user"
 
-            # Subagent content is already in `history` above; passing it again
-            # as current_message would double-project it into the prompt.
+            # Subagent results are persisted as user role in history (see
+            # _persist_subagent_followup) so the LLM naturally responds to
+            # them.  Pass current_message="" to avoid duplicating the content
+            # which is already in history.
             messages = self.context.build_messages(
                 history=history,
                 current_message="" if is_subagent else msg.content,
                 channel=channel,
                 chat_id=chat_id,
                 session_summary=pending,
-                current_role=current_role,
+                current_role="user",
                 model=self.model,
             )
             final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
@@ -1222,7 +1223,7 @@ class AgentLoop:
         ):
             return False
         session.add_message(
-            "assistant",
+            "user",
             msg.content,
             sender_id=msg.sender_id,
             injected_event="subagent_result",

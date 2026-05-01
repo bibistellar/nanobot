@@ -258,6 +258,8 @@ class SubagentManager:
         )
 
         # Inject as system message to trigger main agent.
+        # sender_id="subagent" lets the dispatch path identify this as a
+        # subagent result and persist it with the correct role.
         # Use session_key_override to align with the main agent's effective
         # session key (which accounts for unified sessions) so the result is
         # routed to the correct pending queue (mid-turn injection) instead of

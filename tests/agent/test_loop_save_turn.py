@@ -678,13 +678,14 @@ def test_prompt_merge_does_not_replace_standalone_subagent_history_entry(tmp_pat
     projected = builder.build_messages(
         history=session.get_history(max_messages=0),
         current_message="",
-        current_role="assistant",
+        current_role="user",
         channel="cli",
         chat_id="merge",
     )
 
     non_system = [m for m in projected if m.get("role") != "system"]
     assert len(non_system) == 2
+    assert non_system[-1]["role"] == "user"
     assert "subagent result" in non_system[-1]["content"]
     assert session.messages[-1]["content"] == "subagent result"
     assert session.messages[-1]["injected_event"] == "subagent_result"

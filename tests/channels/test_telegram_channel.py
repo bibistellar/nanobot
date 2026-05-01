@@ -143,7 +143,7 @@ def _make_telegram_update(
     reply_to_message=None,
     location=None,
 ):
-    user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
+    user = SimpleNamespace(id=12345, username="alice", first_name="Alice", last_name=None)
     message = SimpleNamespace(
         chat=SimpleNamespace(type=chat_type, is_forum=False),
         chat_id=-100123,

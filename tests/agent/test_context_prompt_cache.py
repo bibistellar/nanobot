@@ -253,20 +253,25 @@ def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
     assert "messaging app" in system
 
 
-def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path) -> None:
+def test_subagent_result_persisted_as_user_gets_llm_response(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
     messages = builder.build_messages(
-        history=[{"role": "assistant", "content": "previous result"}],
-        current_message="subagent result",
+        history=[
+            {"role": "assistant", "content": "spawning subagent..."},
+            {"role": "user", "content": "[Subagent completed]\nresult here"},
+        ],
+        current_message="",
         channel="cli",
         chat_id="direct",
-        current_role="assistant",
+        current_role="user",
     )
 
-    for left, right in zip(messages, messages[1:]):
-        assert not (left.get("role") == right.get("role") == "assistant")
+    non_system = [m for m in messages if m.get("role") != "system"]
+    # Last message should be user role (subagent result merged with empty current)
+    assert non_system[-1]["role"] == "user"
+    assert "Subagent completed" in non_system[-1]["content"]
 
 
 def test_always_skills_excluded_from_skills_index(tmp_path) -> None:

@@ -1169,9 +1169,9 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, status)
 
     mgr._announce_result.assert_awaited_once()
-    args = mgr._announce_result.await_args.args
-    assert args[3] == "Task completed but no final response was generated."
-    assert args[5] == "ok"
+    kwargs = mgr._announce_result.await_args.kwargs
+    assert kwargs["result"] == "Task completed but no final response was generated."
+    assert kwargs["status"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -2109,8 +2109,13 @@ async def test_checkpoint2_injects_after_final_response_with_resuming_stream():
 
 
 @pytest.mark.asyncio
-async def test_checkpoint2_preserves_final_response_in_history_before_followup():
-    """A follow-up injected after a final answer must still see that answer in history."""
+async def test_followup_injection_discards_assistant_draft():
+    """A follow-up injected after a draft answer must replace, not append.
+
+    The draft was never delivered to the user; keeping it in messages would
+    cause the next iteration's LLM to repeat its own un-delivered content.
+    The next iteration must see only user history + the injection.
+    """
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
     from nanobot.bus.events import InboundMessage
 
@@ -2148,17 +2153,18 @@ async def test_checkpoint2_preserves_final_response_in_history_before_followup()
 
     assert result.final_content == "second answer"
     assert call_count["n"] == 2
+    # Second LLM call sees user history + injection, no draft assistant turn.
+    # The original user message and the injection merge because they are both
+    # user-role and adjacent (no assistant in between).
     assert captured_messages[-1] == [
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "first answer"},
-        {"role": "user", "content": "follow-up question"},
+        {"role": "user", "content": "hello\n\nfollow-up question"},
     ]
+    # Only the final answer is persisted; the draft never enters result.messages.
     assert [
         {"role": message["role"], "content": message["content"]}
         for message in result.messages
         if message.get("role") == "assistant"
     ] == [
-        {"role": "assistant", "content": "first answer"},
         {"role": "assistant", "content": "second answer"},
     ]
 
@@ -2225,7 +2231,7 @@ async def test_loop_injected_followup_preserves_image_media(tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_merges_multiple_injected_user_messages_without_losing_media():
-    """Multiple injected follow-ups should not create lossy consecutive user messages."""
+    """Multiple injected follow-ups should preserve all media + text content."""
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
@@ -2271,17 +2277,25 @@ async def test_runner_merges_multiple_injected_user_messages_without_losing_medi
     assert call_count["n"] == 2
     second_call = captured_messages[-1]
     user_messages = [message for message in second_call if message.get("role") == "user"]
-    assert len(user_messages) == 2
-    injected = user_messages[-1]
-    assert isinstance(injected["content"], list)
+    # All adjacent user messages merge into one (the original "hello" plus both
+    # injections), since there is no assistant draft separating them.
+    assert len(user_messages) == 1
+    merged = user_messages[0]
+    assert isinstance(merged["content"], list)
     assert any(
         block.get("type") == "image_url"
-        for block in injected["content"]
+        for block in merged["content"]
         if isinstance(block, dict)
     )
     assert any(
         block.get("type") == "text" and block.get("text") == "and answer briefly"
-        for block in injected["content"]
+        for block in merged["content"]
+        if isinstance(block, dict)
+    )
+    # The original "hello" should also be preserved in the merged content.
+    assert any(
+        block.get("type") == "text" and "hello" in block.get("text", "")
+        for block in merged["content"]
         if isinstance(block, dict)
     )
 

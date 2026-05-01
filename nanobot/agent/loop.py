@@ -28,15 +28,12 @@ from nanobot.agent.tools.ask import (
     pending_ask_user_id,
 )
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.defaults import build_default_tools
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.self import MyTool
-from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -349,43 +346,20 @@ class AgentLoop:
             self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
         )
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-        self.tools.register(AskUserTool())
-        self.tools.register(
-            ReadFileTool(
-                workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
-            )
+
+        # Filesystem / search / exec / web — shared with sub-agents via the
+        # build_default_tools helper. Main-only tools are registered below.
+        build_default_tools(
+            self.workspace,
+            exec_config=self.exec_config,
+            web_config=self.web_config,
+            restrict_to_workspace=self.restrict_to_workspace,
+            extra_read_dirs=extra_read,
+            registry=self.tools,
         )
-        for cls in (WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        for cls in (GlobTool, GrepTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+
+        self.tools.register(AskUserTool())
         self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        if self.exec_config.enable:
-            self.tools.register(
-                ExecTool(
-                    working_dir=str(self.workspace),
-                    timeout=self.exec_config.timeout,
-                    restrict_to_workspace=self.restrict_to_workspace,
-                    sandbox=self.exec_config.sandbox,
-                    path_append=self.exec_config.path_append,
-                    allowed_env_keys=self.exec_config.allowed_env_keys,
-                )
-            )
-        if self.web_config.enable:
-            self.tools.register(
-                WebSearchTool(
-                    config=self.web_config.search,
-                    proxy=self.web_config.proxy,
-                    user_agent=self.web_config.user_agent,
-                )
-            )
-            self.tools.register(
-                WebFetchTool(
-                    config=self.web_config.fetch,
-                    proxy=self.web_config.proxy,
-                    user_agent=self.web_config.user_agent,
-                )
-            )
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound, workspace=self.workspace))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
@@ -558,13 +532,17 @@ class AgentLoop:
             self._set_runtime_checkpoint(session, payload)
 
         async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
-            """Drain follow-up messages from the pending queue.
+            """Drain follow-up messages from the pending queue (non-blocking).
 
-            When no messages are immediately available but sub-agents
-            spawned in this dispatch are still running, blocks until at
-            least one result arrives (or timeout).  This keeps the runner
-            loop alive so subsequent sub-agent completions are consumed
-            in-order rather than dispatched separately.
+            Pulls whatever is currently sitting in the per-session pending
+            queue (mid-turn injections from the bus) up to ``limit``. Never
+            blocks: if the queue is empty, returns ``[]`` and the runner ends
+            the turn naturally.
+
+            Sub-agent results that arrive while the turn is still active flow
+            through this drain like any other injection. Results that arrive
+            after the turn has ended are processed as independent turns via
+            the system-channel dispatch path.
             """
             if pending_queue is None:
                 return []
@@ -593,28 +571,6 @@ class AgentLoop:
                     items.append(_to_user_message(pending_queue.get_nowait()))
                 except asyncio.QueueEmpty:
                     break
-
-            # Block if nothing drained but sub-agents spawned in this dispatch
-            # are still running.  Keeps the runner loop alive so subsequent
-            # completions are injected in-order rather than dispatched separately.
-            if (not items
-                    and session is not None
-                    and self.subagents.get_running_count_by_session(session.key) > 0):
-                try:
-                    msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Timeout waiting for sub-agent completion in session {}",
-                        session.key,
-                    )
-                    return items
-                items.append(_to_user_message(msg))
-                while len(items) < limit:
-                    try:
-                        items.append(_to_user_message(pending_queue.get_nowait()))
-                    except asyncio.QueueEmpty:
-                        break
-
             return items
 
         result = await self.runner.run(AgentRunSpec(
@@ -868,93 +824,11 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         self._refresh_provider_snapshot()
-        # System messages: parse origin from chat_id ("channel:chat_id")
-        if msg.channel == "system":
-            channel, chat_id = (
-                msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
-            )
-            logger.info("Processing system message from {}", msg.sender_id)
-            # Honor session_key_override so subagent announces from threaded
-            # callers route to the originating thread session, not the
-            # channel-level session derived from chat_id.
-            key = msg.session_key_override or f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
-            if self._restore_runtime_checkpoint(session):
-                self.sessions.save(session)
-            if self._restore_pending_user_turn(session):
-                self.sessions.save(session)
-
-            session, pending = self.auto_compact.prepare_session(session, key)
-
-            await self.consolidator.maybe_consolidate_by_tokens(
-                session,
-                session_summary=pending,
-            )
-            # Persist subagent follow-ups into durable history BEFORE prompt
-            # assembly. ContextBuilder merges adjacent same-role messages for
-            # provider compatibility, which previously caused the follow-up to
-            # disappear from session.messages while still being visible to the
-            # LLM via the merged prompt. See _persist_subagent_followup.
-            is_subagent = msg.sender_id == "subagent"
-            if is_subagent and self._persist_subagent_followup(session, msg):
-                self.sessions.save(session)
-            self._set_tool_context(
-                channel, chat_id, msg.metadata.get("message_id"),
-                msg.metadata, session_key=key,
-            )
-            _hist_kwargs: dict[str, Any] = {
-                "max_messages": self._max_messages,
-                "max_tokens": self._replay_token_budget(),
-                "include_timestamps": True,
-            }
-            history = session.get_history(**_hist_kwargs)
-
-            # Subagent results are persisted as user role in history (see
-            # _persist_subagent_followup) so the LLM naturally responds to
-            # them.  Pass current_message="" to avoid duplicating the content
-            # which is already in history.
-            messages = self.context.build_messages(
-                history=history,
-                current_message="" if is_subagent else msg.content,
-                channel=channel,
-                chat_id=chat_id,
-                session_summary=pending,
-                current_role="user",
-                model=self.model,
-            )
-            final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
-                messages, session=session, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-                metadata=msg.metadata,
-                session_key=key,
-                pending_queue=pending_queue,
-            )
-            self._save_turn(session, all_msgs, 1 + len(history))
-            session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
-            self._clear_runtime_checkpoint(session)
-            self.sessions.save(session)
-            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
-            options = ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else []
-            content, buttons = ask_user_outbound(
-                final_content or "Background task completed.",
-                options,
-                channel,
-            )
-            # Reconstruct channel-specific metadata from session.key so the
-            # outbound reply lands in the originating thread (not the channel
-            # top-level). The announce InboundMessage carries only
-            # injected_event metadata; we recover thread_ts from the session
-            # key, which slack writes as "slack:<chat_id>:<thread_ts>".
-            outbound_metadata: dict[str, Any] = {}
-            if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
-                outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
-            return OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=content,
-                buttons=buttons,
-                metadata=outbound_metadata,
-            )
+        # Sub-agent results carry ``metadata["type"] == "subagent_result"``;
+        # they fan out to a dedicated path that persists the structured result
+        # and lets the LLM produce a user-facing summary.
+        if isinstance(msg.metadata, dict) and msg.metadata.get("type") == "subagent_result":
+            return await self._handle_subagent_result(msg, pending_queue=pending_queue)
 
         # Extract document text from media at the processing boundary so all
         # channels benefit without format-specific logic in ContextBuilder.
@@ -1207,29 +1081,143 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
-        """Persist subagent follow-ups before prompt assembly so history stays durable.
+    _SUBAGENT_TASK_INDEX_KEY = "subagent_task_index"
 
-        Returns True if a new entry was appended; False if the follow-up was
-        deduped (same ``subagent_task_id`` already in session) or carries no
-        content worth persisting.
+    def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
+        """Persist a sub-agent result into session history with structured fields.
+
+        The persisted message stores the subagent payload (``type``,
+        ``task_id``, ``status``, ``duration_ms``, ``label``, ``result_task``,
+        ``result``, ``token_usage``) on top of the standard role/content
+        fields. ``ContextBuilder._project_history`` later renders these into
+        a user-role message via ``agent/subagent_announce.md``.
+
+        Dedup is keyed on ``task_id`` via an index stored in session
+        metadata (O(1) lookup) instead of scanning ``session.messages`` on
+        every announce.
+
+        Returns True if a new entry was appended; False if the result carries
+        no content worth persisting or its ``task_id`` was already recorded.
         """
         if not msg.content:
             return False
-        task_id = msg.metadata.get("subagent_task_id") if isinstance(msg.metadata, dict) else None
-        if task_id and any(
-            m.get("injected_event") == "subagent_result" and m.get("subagent_task_id") == task_id
-            for m in session.messages
-        ):
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        task_id = metadata.get("task_id")
+
+        index = session.metadata.setdefault(self._SUBAGENT_TASK_INDEX_KEY, {})
+        if task_id and task_id in index:
             return False
+
         session.add_message(
             "user",
             msg.content,
             sender_id=msg.sender_id,
-            injected_event="subagent_result",
-            subagent_task_id=task_id,
+            type="subagent_result",
+            task_id=task_id,
+            label=metadata.get("label"),
+            status=metadata.get("status"),
+            duration_ms=metadata.get("duration_ms"),
+            result_task=metadata.get("result_task"),
+            result=msg.content,
+            token_usage=metadata.get("token_usage"),
         )
+        if task_id:
+            index[task_id] = len(session.messages) - 1
         return True
+
+    async def _handle_subagent_result(
+        self,
+        msg: InboundMessage,
+        *,
+        pending_queue: asyncio.Queue | None,
+    ) -> OutboundMessage | None:
+        """Process a sub-agent result inbound message.
+
+        Persists the structured result, runs the agent loop so the LLM can
+        produce a user-facing summary, and returns the outbound message
+        targeted at the origin channel/thread.
+        """
+        channel = msg.channel
+        chat_id = msg.chat_id
+        logger.info(
+            "Processing subagent result task={} status={}",
+            (msg.metadata or {}).get("task_id"),
+            (msg.metadata or {}).get("status"),
+        )
+
+        key = msg.session_key_override or f"{channel}:{chat_id}"
+        session = self.sessions.get_or_create(key)
+        if self._restore_runtime_checkpoint(session):
+            self.sessions.save(session)
+        if self._restore_pending_user_turn(session):
+            self.sessions.save(session)
+
+        session, pending = self.auto_compact.prepare_session(session, key)
+
+        await self.consolidator.maybe_consolidate_by_tokens(
+            session,
+            session_summary=pending,
+        )
+
+        # Persist before prompt assembly so the new history entry survives
+        # any consolidation that happens later in the turn.
+        if self._persist_subagent_followup(session, msg):
+            self.sessions.save(session)
+
+        self._set_tool_context(
+            channel, chat_id, (msg.metadata or {}).get("message_id"),
+            msg.metadata, session_key=key,
+        )
+        _hist_kwargs: dict[str, Any] = {
+            "max_messages": self._max_messages,
+            "max_tokens": self._replay_token_budget(),
+            "include_timestamps": True,
+        }
+        history = session.get_history(**_hist_kwargs)
+
+        # The subagent result is already in history (projected as a user-role
+        # rendered message by ContextBuilder). Pass current_message="" so we
+        # don't duplicate it.
+        messages = self.context.build_messages(
+            history=history,
+            current_message="",
+            channel=channel,
+            chat_id=chat_id,
+            session_summary=pending,
+            current_role="user",
+            model=self.model,
+        )
+        final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
+            messages, session=session, channel=channel, chat_id=chat_id,
+            message_id=(msg.metadata or {}).get("message_id"),
+            metadata=msg.metadata,
+            session_key=key,
+            pending_queue=pending_queue,
+        )
+        self._save_turn(session, all_msgs, 1 + len(history))
+        session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        self._clear_runtime_checkpoint(session)
+        self.sessions.save(session)
+        self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+        options = ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else []
+        content, buttons = ask_user_outbound(
+            final_content or "Background task completed.",
+            options,
+            channel,
+        )
+        # Slack threads encode thread_ts in the session key as
+        # ``slack:<chat_id>:<thread_ts>``. Recover it here so the reply lands
+        # in the originating thread rather than the channel top-level.
+        outbound_metadata: dict[str, Any] = {}
+        if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
+            outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
+        return OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+            buttons=buttons,
+            metadata=outbound_metadata,
+        )
 
     def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
         """Persist the latest in-flight turn state into session metadata."""

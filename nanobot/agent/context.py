@@ -14,6 +14,22 @@ from nanobot.utils.helpers import build_assistant_message, current_time_str, det
 from nanobot.utils.prompt_templates import render_template
 
 
+_SUBAGENT_STATUS_TEXT = {
+    "completed": "completed successfully",
+    "failed": "failed",
+    "timeout": "timed out",
+    "interrupted": "was interrupted",
+    "error": "failed",
+    "ok": "completed successfully",
+}
+
+
+def _subagent_status_text(status: str | None) -> str:
+    if not status:
+        return "completed"
+    return _SUBAGENT_STATUS_TEXT.get(status, status)
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
@@ -151,6 +167,58 @@ class ContextBuilder:
         """Check if the current model requires system prompt in user message."""
         return any(model.startswith(prefix) for prefix in self.system_to_user_models)
 
+    @staticmethod
+    def _project_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project session history into messages safe to send to the LLM.
+
+        Messages tagged with an internal ``type`` are translated to standard
+        LLM-API roles. Currently:
+
+        * ``type == "subagent_result"`` → rendered as a ``user``-role message
+          using ``agent/subagent_announce.md``. Structured payload fields
+          (``task_id``/``status``/``duration_ms``/...) drive the template;
+          they are stripped from the projected message.
+        * ``type == "subagent_spawned"`` → skipped entirely (the spawn record
+          exists for session bookkeeping; the LLM doesn't need to see a
+          duplicate of the spawn tool result).
+        * Any other ``type`` (or no ``type``) → passed through after
+          stripping internal payload fields.
+        """
+        projected: list[dict[str, Any]] = []
+        for message in history:
+            msg_type = message.get("type")
+            if msg_type == "subagent_spawned":
+                continue
+            if msg_type == "subagent_result":
+                rendered = render_template(
+                    "agent/subagent_announce.md",
+                    label=message.get("label") or "subagent",
+                    status_text=_subagent_status_text(message.get("status")),
+                    task=message.get("result_task") or "",
+                    result=message.get("content") or message.get("result") or "",
+                )
+                projected.append({"role": "user", "content": rendered})
+                continue
+            entry = {
+                k: v for k, v in message.items()
+                if k not in ContextBuilder._INTERNAL_PROJECTION_FIELDS
+            }
+            projected.append(entry)
+        return projected
+
+    _INTERNAL_PROJECTION_FIELDS = frozenset({
+        "type",
+        "task_id",
+        "parent_task_id",
+        "label",
+        "status",
+        "duration_ms",
+        "result",
+        "result_task",
+        "token_usage",
+        "spawned_at",
+    })
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -184,12 +252,14 @@ class ContextBuilder:
         else:
             merged = [{"type": "text", "text": f"{system_prefix}{runtime_ctx}"}] + user_content
 
+        projected_history = self._project_history(history)
+
         if inject_system:
-            messages = [*history]
+            messages = [*projected_history]
         else:
             messages = [
                 {"role": "system", "content": system_prompt},
-                *history,
+                *projected_history,
             ]
 
         if messages and messages[-1].get("role") == current_role:

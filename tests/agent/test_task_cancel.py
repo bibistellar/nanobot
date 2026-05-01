@@ -354,12 +354,12 @@ class TestSubagentCancellation:
         await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, status)
 
         mgr._announce_result.assert_awaited_once()
-        args = mgr._announce_result.await_args.args
-        assert "Completed steps:" in args[3]
-        assert "- list_dir: first result" in args[3]
-        assert "Failure:" in args[3]
-        assert "- list_dir: boom" in args[3]
-        assert args[5] == "error"
+        kwargs = mgr._announce_result.await_args.kwargs
+        assert "Completed steps:" in kwargs["result"]
+        assert "- list_dir: first result" in kwargs["result"]
+        assert "Failure:" in kwargs["result"]
+        assert "- list_dir: boom" in kwargs["result"]
+        assert kwargs["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):
@@ -433,6 +433,18 @@ class TestSubagentAnnounceSessionKey:
         )
         return mgr, bus
 
+    async def _announce_default(self, mgr, *, task_id, origin, status="completed"):
+        await mgr._announce_result(
+            task_id=task_id,
+            label="label",
+            task="task",
+            result="result",
+            origin=origin,
+            status=status,
+            duration_ms=42,
+            token_usage=None,
+        )
+
     @pytest.mark.asyncio
     async def test_announce_uses_effective_key_in_unified_mode(self):
         """In unified session mode, session_key_override must be 'unified:default'
@@ -440,7 +452,7 @@ class TestSubagentAnnounceSessionKey:
         mgr, bus = self._make_mgr()
 
         origin = {"channel": "telegram", "chat_id": "111", "session_key": "unified:default"}
-        await mgr._announce_result("sub-1", "label", "task", "result", origin, "ok")
+        await self._announce_default(mgr, task_id="sub-1", origin=origin)
 
         msg = await bus.consume_inbound()
         assert msg.session_key_override == "unified:default"
@@ -452,7 +464,7 @@ class TestSubagentAnnounceSessionKey:
         mgr, bus = self._make_mgr()
 
         origin = {"channel": "telegram", "chat_id": "222", "session_key": "telegram:222"}
-        await mgr._announce_result("sub-2", "label", "task", "result", origin, "ok")
+        await self._announce_default(mgr, task_id="sub-2", origin=origin)
 
         msg = await bus.consume_inbound()
         assert msg.session_key_override == "telegram:222"
@@ -464,12 +476,17 @@ class TestSubagentAnnounceSessionKey:
         mgr, bus = self._make_mgr()
 
         origin = {"channel": "discord", "chat_id": "333", "session_key": None}
-        await mgr._announce_result("sub-3", "label", "task", "result", origin, "ok")
+        await self._announce_default(mgr, task_id="sub-3", origin=origin)
 
         msg = await bus.consume_inbound()
         assert msg.session_key_override == "discord:333"
-        assert msg.channel == "system"
-        assert msg.chat_id == "discord:333"
+        # Announces now use the origin channel/chat_id directly so the
+        # InboundMessage looks like a real message from that channel; the
+        # subagent-result branch is selected via metadata.type instead.
+        assert msg.channel == "discord"
+        assert msg.chat_id == "333"
+        assert msg.metadata.get("type") == "subagent_result"
+        assert msg.metadata.get("task_id") == "sub-3"
 
     @pytest.mark.asyncio
     async def test_session_key_flows_through_run_subagent(self):

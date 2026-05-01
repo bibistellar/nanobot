@@ -59,8 +59,30 @@ class Session:
             return content
         return f"[Message Time: {timestamp}]\n{content}"
 
+    # Internal type tags for messages that need special projection at LLM
+    # context-building time (e.g. sub-agent results that should be rendered as
+    # a formatted user-role message, sub-agent spawn records that should be
+    # skipped entirely). Messages without an explicit ``type`` field default
+    # to ``type == role`` and are passed through as-is.
+    _SUBAGENT_PAYLOAD_FIELDS: tuple[str, ...] = (
+        "type",
+        "task_id",
+        "parent_task_id",
+        "label",
+        "status",
+        "duration_ms",
+        "result",
+        "token_usage",
+        "spawned_at",
+    )
+
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
+        """Add a message to the session.
+
+        Extra ``kwargs`` are stored on the message verbatim; a special
+        ``type`` field can be used to tag messages for projection at LLM
+        context-building time (see ``ContextBuilder.build_messages``).
+        """
         msg = {
             "role": role,
             "content": content,
@@ -121,6 +143,22 @@ class Session:
             for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
                 if key in message:
                     entry[key] = message[key]
+            # Pass through type + sub-agent payload fields so ContextBuilder
+            # can project them (e.g. subagent_result → user-role rendered
+            # text, subagent_spawned → skipped). Plain messages without a
+            # ``type`` are unaffected.
+            for key in self._SUBAGENT_PAYLOAD_FIELDS:
+                if key in message:
+                    entry[key] = message[key]
+            # Backward compatibility: legacy sub-agent results stored before
+            # Phase 2 used ``injected_event="subagent_result"`` and
+            # ``subagent_task_id`` instead of the structured ``type`` /
+            # ``task_id`` fields. Synthesize the new shape on read so the
+            # projection layer can treat both uniformly.
+            if entry.get("type") is None and message.get("injected_event") == "subagent_result":
+                entry["type"] = "subagent_result"
+                if "task_id" not in entry and message.get("subagent_task_id"):
+                    entry["task_id"] = message["subagent_task_id"]
             out.append(entry)
 
         if max_tokens > 0 and out:

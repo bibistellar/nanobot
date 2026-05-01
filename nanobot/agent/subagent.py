@@ -324,6 +324,28 @@ class SubagentManager:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)
 
+    def get_task_summary(self, session_key: str) -> str:
+        """Return a human-readable summary of tasks for a session.
+
+        Used by runtime context injection so the LLM always knows what
+        background tasks are running.
+        """
+        task_ids = self._session_tasks.get(session_key, set())
+        if not task_ids:
+            return ""
+        lines = []
+        for tid in sorted(task_ids):
+            status = self._task_statuses.get(tid)
+            if not status:
+                continue
+            elapsed = int(time.monotonic() - status.started_at)
+            if status.phase in ("done", "error"):
+                state = "completed" if status.phase == "done" else f"failed: {status.error or 'unknown'}"
+            else:
+                state = f"running ({elapsed}s, phase: {status.phase}, iteration: {status.iteration})"
+            lines.append(f"- [{status.label}] (id: {tid}) {state}")
+        return "\n".join(lines)
+
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)

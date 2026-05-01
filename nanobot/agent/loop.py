@@ -641,33 +641,44 @@ class AgentLoop:
             # is processing this session), route the message there for mid-turn
             # injection instead of creating a competing task.
             if effective_key in self._pending_queues:
+                # Sub-agent results must NOT be injected mid-turn: they need
+                # the full _handle_subagent_result path (template rendering,
+                # structured persistence). Let them fall through to create an
+                # independent task; the per-session lock serialises them after
+                # the current turn finishes.
+                is_subagent_result = (
+                    isinstance(msg.metadata, dict)
+                    and msg.metadata.get("type") == "subagent_result"
+                )
                 # Non-priority commands must not be queued for injection;
                 # dispatch them directly (same pattern as priority commands).
-                if self.commands.is_dispatchable_command(raw):
+                if not is_subagent_result and self.commands.is_dispatchable_command(raw):
                     await self._dispatch_command_inline(
                         msg, effective_key, raw,
                         self.commands.dispatch,
                     )
                     continue
-                pending_msg = msg
-                if effective_key != msg.session_key:
-                    pending_msg = dataclasses.replace(
-                        msg,
-                        session_key_override=effective_key,
-                    )
-                try:
-                    self._pending_queues[effective_key].put_nowait(pending_msg)
-                except asyncio.QueueFull:
-                    logger.warning(
-                        "Pending queue full for session {}, falling back to queued task",
-                        effective_key,
-                    )
-                else:
-                    logger.info(
-                        "Routed follow-up message to pending queue for session {}",
-                        effective_key,
-                    )
-                    continue
+                if not is_subagent_result:
+                    pending_msg = msg
+                    if effective_key != msg.session_key:
+                        pending_msg = dataclasses.replace(
+                            msg,
+                            session_key_override=effective_key,
+                        )
+                    try:
+                        self._pending_queues[effective_key].put_nowait(pending_msg)
+                    except asyncio.QueueFull:
+                        logger.warning(
+                            "Pending queue full for session {}, falling back to queued task",
+                            effective_key,
+                        )
+                    else:
+                        logger.info(
+                            "Routed follow-up message to pending queue for session {}",
+                            effective_key,
+                        )
+                        continue
+                # is_subagent_result: fall through to independent task below
             # Compute the effective session key before dispatching
             # This ensures /stop command can find tasks correctly when unified session is enabled
             task = asyncio.create_task(self._dispatch(msg))

@@ -352,20 +352,39 @@ class TelegramChannel(BaseChannel):
         self._app.add_error_handler(self._on_error)
 
         # Add command handlers (using Regex to support @username suffixes before bot initialization)
-        self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
-        self._app.add_handler(
-            MessageHandler(
-                filters.Regex(r"^/(new|stop|restart|status|dream|model|history)(?:@\w+)?(?:\s+.*)?$"),
-                self._forward_command,
-            )
-        )
-        self._app.add_handler(
-            MessageHandler(
-                filters.Regex(r"^/(dream-log|dream_log|dream-restore|dream_restore)(?:@\w+)?(?:\s+.*)?$"),
-                self._forward_command,
-            )
-        )
-        self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+        # In groups, only respond to commands explicitly directed at this bot
+        # (e.g. /new@nanostellar_bot). In private chats, bare /new works.
+        _cmd_names = r"new|stop|restart|status|dream|model|history"
+        _cmd_names_hyphen = r"dream-log|dream_log|dream-restore|dream_restore"
+        _bot_suffix = r"@" + (self._bot_username or r"\w+")
+
+        # Private chat: accept bare commands
+        self._app.add_handler(MessageHandler(
+            filters.Regex(r"^/start(?:@\w+)?$") & filters.ChatType.PRIVATE, self._on_start))
+        self._app.add_handler(MessageHandler(
+            filters.Regex(rf"^/({_cmd_names})(?:@\w+)?(?:\s+.*)?$") & filters.ChatType.PRIVATE,
+            self._forward_command,
+        ))
+        self._app.add_handler(MessageHandler(
+            filters.Regex(rf"^/({_cmd_names_hyphen})(?:@\w+)?(?:\s+.*)?$") & filters.ChatType.PRIVATE,
+            self._forward_command,
+        ))
+        self._app.add_handler(MessageHandler(
+            filters.Regex(r"^/help(?:@\w+)?$") & filters.ChatType.PRIVATE, self._on_help))
+
+        # Group chat: only accept commands with @bot_username
+        self._app.add_handler(MessageHandler(
+            filters.Regex(rf"^/start{_bot_suffix}$"), self._on_start))
+        self._app.add_handler(MessageHandler(
+            filters.Regex(rf"^/({_cmd_names}){_bot_suffix}(?:\s+.*)?$"),
+            self._forward_command,
+        ))
+        self._app.add_handler(MessageHandler(
+            filters.Regex(rf"^/({_cmd_names_hyphen}){_bot_suffix}(?:\s+.*)?$"),
+            self._forward_command,
+        ))
+        self._app.add_handler(MessageHandler(
+            filters.Regex(rf"^/help{_bot_suffix}$"), self._on_help))
 
         # Add message handler for text, photos, video, voice, documents, and locations
         self._app.add_handler(

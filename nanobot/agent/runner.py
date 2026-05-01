@@ -152,16 +152,13 @@ class AgentRunner:
         """Drain pending injections. Returns (should_continue, updated_cycles).
 
         If injections are found and we haven't exceeded _MAX_INJECTION_CYCLES,
-        append them to *messages* and return (True, cycles+1) so the caller
-        continues the iteration loop. Otherwise return (False, cycles).
+        append them to *messages* (and emit a checkpoint if *assistant_message*
+        and *iteration* are both provided) and return (True, cycles+1) so the
+        caller continues the iteration loop.  Otherwise return (False, cycles).
 
-        When ``assistant_message`` is provided (the natural-language
-        final-response branch), it represents a streamed but un-finalized draft.
-        We intentionally discard it instead of appending: keeping the draft in
-        ``messages`` would let the next iteration's LLM see its own un-delivered
-        content and repeat it. By dropping the draft, the next iteration sees a
-        clean user-only history plus the injection, and generates one unified
-        reply.
+        This is only called during tool-execution phases (before any final
+        response has been streamed), so appending the assistant message here
+        is safe — the user hasn't seen it yet.
         """
         if injection_cycles >= _MAX_INJECTION_CYCLES:
             return False, injection_cycles
@@ -169,14 +166,24 @@ class AgentRunner:
         if not injections:
             return False, injection_cycles
         injection_cycles += 1
-        # ``assistant_message`` (if any) is dropped on purpose — see docstring.
-        # The "final_response" checkpoint is also skipped because the draft is
-        # no longer part of the turn we intend to persist.
+        if assistant_message is not None:
+            messages.append(assistant_message)
+            if iteration is not None:
+                await self._emit_checkpoint(
+                    spec,
+                    {
+                        "phase": "final_response",
+                        "iteration": iteration,
+                        "model": spec.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": [],
+                        "pending_tool_calls": [],
+                    },
+                )
         self._append_injected_messages(messages, injections)
         logger.info(
-            "Injected {} follow-up message(s) {} ({}/{}){}",
+            "Injected {} follow-up message(s) {} ({}/{})",
             len(injections), phase, injection_cycles, _MAX_INJECTION_CYCLES,
-            "; discarded assistant draft" if assistant_message is not None else "",
         )
         return True, injection_cycles
 
@@ -448,24 +455,13 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-            # Check for mid-turn injections BEFORE signaling stream end.
-            # If injections are found we keep the stream alive (resuming=True)
-            # so streaming channels edit the same message instead of creating
-            # a duplicate.
-            should_continue, injection_cycles = await self._try_drain_injections(
-                spec, messages, assistant_message, injection_cycles,
-                phase="after final response",
-                iteration=iteration,
-            )
-            if should_continue:
-                had_injections = True
-
+            # Do NOT check for injections after the final response.
+            # Streaming has already delivered content to the user — the turn
+            # is committed. Any pending follow-ups (user messages, sub-agent
+            # results) will be processed as independent turns after the
+            # pending queue is drained in the _dispatch finally block.
             if hook.wants_streaming():
-                await hook.on_stream_end(context, resuming=should_continue)
-
-            if should_continue:
-                await hook.after_iteration(context)
-                continue
+                await hook.on_stream_end(context, resuming=False)
 
             if response.finish_reason == "error":
                 final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
@@ -476,13 +472,6 @@ class AgentRunner:
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
-                should_continue, injection_cycles = await self._try_drain_injections(
-                    spec, messages, None, injection_cycles,
-                    phase="after LLM error",
-                )
-                if should_continue:
-                    had_injections = True
-                    continue
                 break
             if is_blank_text(clean):
                 final_content = EMPTY_FINAL_RESPONSE_MESSAGE
@@ -493,13 +482,6 @@ class AgentRunner:
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
-                should_continue, injection_cycles = await self._try_drain_injections(
-                    spec, messages, None, injection_cycles,
-                    phase="after empty response",
-                )
-                if should_continue:
-                    had_injections = True
-                    continue
                 break
 
             messages.append(assistant_message or build_assistant_message(

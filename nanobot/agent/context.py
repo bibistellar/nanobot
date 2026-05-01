@@ -66,17 +66,16 @@ class ContextBuilder:
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Short-term Memory\n\n{memory}")
 
-        # Long-term memory (Dashscope cloud)
+        # Long-term memory hint (actual retrieval happens in build_messages
+        # using the user's current message as the search query).
         if self.dashscope:
-            try:
-                nodes = self.dashscope.list_memory()
-                if nodes:
-                    lines = [f"- {n.get('content', '')}" for n in nodes if n.get("content")]
-                    if lines:
-                        parts.append(f"# Long-term Memory\n\n" + "\n".join(lines))
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("Dashscope memory load failed: %s", e)
+            parts.append(
+                "# Long-term Memory\n\n"
+                "You have a long-term memory store. Relevant memories are "
+                "automatically retrieved and shown in [Long-term Memory] blocks "
+                "before the user's message. You can also proactively search or "
+                "add memories using the memory-manage skill when needed."
+            )
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -236,6 +235,16 @@ class ContextBuilder:
         task_summary: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
+        # Retrieve long-term memories relevant to the current message
+        ltm_block = ""
+        if self.dashscope and current_message:
+            try:
+                ltm = self.dashscope.search_memory(query=current_message)
+                if ltm:
+                    ltm_block = f"\n[Long-term Memory]\n{ltm}\n[/Long-term Memory]\n"
+            except Exception:
+                pass
+
         runtime_ctx = self._build_runtime_context(
             channel, chat_id, self.timezone,
             session_summary=session_summary,
@@ -253,12 +262,12 @@ class ContextBuilder:
         else:
             system_prefix = ""
 
-        # Merge runtime context and user content into a single user message
-        # to avoid consecutive same-role messages that some providers reject.
+        # Merge runtime context, long-term memory, and user content into a
+        # single user message to avoid consecutive same-role messages.
         if isinstance(user_content, str):
-            merged = f"{system_prefix}{runtime_ctx}\n\n{user_content}"
+            merged = f"{system_prefix}{runtime_ctx}{ltm_block}\n\n{user_content}"
         else:
-            merged = [{"type": "text", "text": f"{system_prefix}{runtime_ctx}"}] + user_content
+            merged = [{"type": "text", "text": f"{system_prefix}{runtime_ctx}{ltm_block}"}] + user_content
 
         projected_history = self._project_history(history)
 

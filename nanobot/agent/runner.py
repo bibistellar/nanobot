@@ -450,7 +450,8 @@ class AgentRunner:
 
             # Check for mid-turn injections BEFORE signaling stream end.
             # If injections are found we keep the stream alive (resuming=True)
-            # so streaming channels don't prematurely finalize the card.
+            # so streaming channels edit the same message instead of creating
+            # a duplicate.
             should_continue, injection_cycles = await self._try_drain_injections(
                 spec, messages, assistant_message, injection_cycles,
                 phase="after final response",

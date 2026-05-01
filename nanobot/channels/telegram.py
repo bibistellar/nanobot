@@ -670,7 +670,8 @@ class TelegramChannel(BaseChannel):
                 # to avoid doubling connection demand during pool exhaustion.
                 if self._is_not_modified_error(e):
                     logger.debug("Final stream edit already applied for {}", chat_id)
-                    self._stream_bufs.pop(chat_id, None)
+                    if not meta.get("_resuming"):
+                        self._stream_bufs.pop(chat_id, None)
                     return
                 logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
                 # Fall back to raw markdown (not HTML) so users don't see raw tags.

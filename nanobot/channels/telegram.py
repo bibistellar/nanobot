@@ -378,13 +378,12 @@ class TelegramChannel(BaseChannel):
             )
         )
 
-        # Conditionally register inline keyboard callback handler
+        # Always register callback handler (system commands like /model use
+        # inline keyboards regardless of the inline_keyboards config flag).
+        self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
+        allowed_updates = ["message", "callback_query"]
         if self.config.inline_keyboards:
-            self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
-            allowed_updates = ["message", "callback_query"]
             logger.debug("Telegram inline keyboards enabled")
-        else:
-            allowed_updates = ["message"]
 
         logger.info("Starting Telegram bot (polling mode)...")
 
@@ -549,7 +548,8 @@ class TelegramChannel(BaseChannel):
         if msg.content and msg.content != "[empty message]":
             render_as_blockquote = bool(msg.metadata.get("_tool_hint"))
             buttons = getattr(msg, "buttons", None) or []
-            reply_markup = self._build_keyboard(buttons) if buttons else None
+            force_kb = bool(msg.metadata.get("_system_buttons"))
+            reply_markup = self._build_keyboard(buttons, force=force_kb) if buttons else None
             text = msg.content
             # Fallback: no native keyboard → splice labels into the message so the choices survive.
             if buttons and reply_markup is None:
@@ -1244,9 +1244,9 @@ class TelegramChannel(BaseChannel):
 
         return ""
 
-    def _build_keyboard(self, buttons: list) -> InlineKeyboardMarkup | None:
-        """Build inline keyboard markup if inline_keyboards is enabled."""
-        if not buttons or not self.config.inline_keyboards:
+    def _build_keyboard(self, buttons: list, force: bool = False) -> InlineKeyboardMarkup | None:
+        """Build inline keyboard markup if inline_keyboards is enabled (or forced)."""
+        if not buttons or (not self.config.inline_keyboards and not force):
             return None
         keyboard = [
             [InlineKeyboardButton(label, callback_data=self._safe_callback_data(label)) for label in row]
@@ -1286,11 +1286,26 @@ class TelegramChannel(BaseChannel):
             except Exception:
                 pass
         logger.debug("Inline button tap from {}: {}", sender_id, button_label)
+
+        # Model picker buttons: strip "✓ " prefix and convert to /model command
+        clean_label = button_label.lstrip("✓ ").strip()
+        if clean_label and clean_label != button_label.strip():
+            # Had a ✓ prefix → this is the currently active model, just acknowledge
+            await query.answer(f"Already using {clean_label}")
+            return
+        # Check if this looks like a model name (no spaces, no slash prefix)
+        # by seeing if the original message was a model picker
+        orig_text = query.message.text if query.message else ""
+        if orig_text and "Select a model:" in orig_text:
+            content = f"/model {clean_label}"
+        else:
+            content = button_label
+
         self._start_typing(str(chat_id))
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str(chat_id),
-            content=button_label,
+            content=content,
             metadata={
                 "callback_query_id": query.id,
                 "button_label": button_label,

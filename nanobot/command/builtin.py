@@ -99,7 +99,7 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
     """Show current model or switch to a different one.
 
     Usage:
-        /model          — show current model and list available models
+        /model          — show current model with interactive model picker
         /model <name>   — switch to the specified model
     """
     loop = ctx.loop
@@ -109,7 +109,7 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
 
     if not target:
         # List available models by querying the provider's /v1/models endpoint
-        models_text = ""
+        model_ids: list[str] = []
         try:
             import json
             import urllib.request
@@ -123,17 +123,24 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode())
                     model_ids = sorted(m["id"] for m in data.get("data", []))
-                    if model_ids:
-                        models_text = "\n\nAvailable models:\n" + "\n".join(
-                            f"  {'→' if m == loop.model else ' '} {m}" for m in model_ids
-                        )
         except Exception:
             pass
+
+        # Build interactive buttons: each model as a "/model <name>" callback
+        buttons: list[list[str]] = []
+        for m in model_ids:
+            prefix = "✓ " if m == loop.model else ""
+            buttons.append([f"{prefix}{m}"])
+
+        meta = dict(ctx.msg.metadata or {})
+        meta["_system_buttons"] = True  # bypass inline_keyboards config check
+
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content=f"Current model: `{loop.model}`{models_text}",
-            metadata=dict(ctx.msg.metadata or {}),
+            content=f"Current model: `{loop.model}`\n\nSelect a model:",
+            buttons=buttons if buttons else None,
+            metadata=meta,
         )
 
     # Switch model

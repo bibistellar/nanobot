@@ -355,7 +355,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
         self._app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/(new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
+                filters.Regex(r"^/(new|stop|restart|status|dream|model|history)(?:@\w+)?(?:\s+.*)?$"),
                 self._forward_command,
             )
         )

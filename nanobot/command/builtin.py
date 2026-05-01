@@ -95,6 +95,58 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_model(ctx: CommandContext) -> OutboundMessage:
+    """Show current model or switch to a different one.
+
+    Usage:
+        /model          — show current model and list available models
+        /model <name>   — switch to the specified model
+    """
+    loop = ctx.loop
+    raw = ctx.raw.strip()
+    # Parse model name from "/model <name>"
+    target = raw[len("/model"):].strip() if raw.startswith("/model") else ""
+
+    if not target:
+        # List available models by querying the provider's /v1/models endpoint
+        models_text = ""
+        try:
+            import json
+            import urllib.request
+            api_base = getattr(loop.provider, "api_base", "") or ""
+            api_key = getattr(loop.provider, "api_key", "") or ""
+            if api_base:
+                url = f"{api_base.rstrip('/')}/models"
+                req = urllib.request.Request(url, headers={
+                    "Authorization": f"Bearer {api_key}",
+                })
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                    model_ids = sorted(m["id"] for m in data.get("data", []))
+                    if model_ids:
+                        models_text = "\n\nAvailable models:\n" + "\n".join(
+                            f"  {'→' if m == loop.model else ' '} {m}" for m in model_ids
+                        )
+        except Exception:
+            pass
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Current model: `{loop.model}`{models_text}",
+            metadata=dict(ctx.msg.metadata or {}),
+        )
+
+    # Switch model
+    old = loop.model
+    loop.model = target
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Model switched: `{old}` → `{target}`",
+        metadata=dict(ctx.msg.metadata or {}),
+    )
+
+
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Stop active task and start a fresh session."""
     loop = ctx.loop
@@ -392,6 +444,7 @@ def build_help_text() -> str:
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
+        "/model [name] — Show current model or switch to a different one",
         "/help — Show available commands",
     ]
     return "\n".join(lines)
@@ -411,4 +464,6 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/dream-log ", cmd_dream_log)
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
+    router.exact("/model", cmd_model)
+    router.prefix("/model ", cmd_model)
     router.exact("/help", cmd_help)

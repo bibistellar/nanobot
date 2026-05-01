@@ -13,11 +13,7 @@ from loguru import logger
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.search import GlobTool, GrepTool
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.defaults import build_default_tools
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig, WebToolsConfig
@@ -158,40 +154,19 @@ class SubagentManager:
             status.iteration = payload.get("iteration", status.iteration)
 
         try:
-            # Build subagent tools (no message tool, no spawn tool)
-            tools = ToolRegistry()
+            # Subagent gets the same filesystem / search / exec / web tools as
+            # the main agent. Caller-specific tools (message, spawn, ask_user,
+            # cron, notebook, my) are intentionally excluded — subagents are
+            # background workers, not user-facing.
             allowed_dir = self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
             extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
-            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            if self.exec_config.enable:
-                tools.register(ExecTool(
-                    working_dir=str(self.workspace),
-                    timeout=self.exec_config.timeout,
-                    restrict_to_workspace=self.restrict_to_workspace,
-                    sandbox=self.exec_config.sandbox,
-                    path_append=self.exec_config.path_append,
-                    allowed_env_keys=self.exec_config.allowed_env_keys,
-                ))
-            if self.web_config.enable:
-                tools.register(
-                    WebSearchTool(
-                        config=self.web_config.search,
-                        proxy=self.web_config.proxy,
-                        user_agent=self.web_config.user_agent,
-                    )
-                )
-                tools.register(
-                    WebFetchTool(
-                        config=self.web_config.fetch,
-                        proxy=self.web_config.proxy,
-                        user_agent=self.web_config.user_agent,
-                    )
-                )
+            tools = build_default_tools(
+                self.workspace,
+                exec_config=self.exec_config,
+                web_config=self.web_config,
+                restrict_to_workspace=self.restrict_to_workspace,
+                extra_read_dirs=extra_read,
+            )
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -213,72 +188,93 @@ class SubagentManager:
             status.phase = "done"
             status.stop_reason = result.stop_reason
 
+            duration_ms = int((time.monotonic() - status.started_at) * 1000)
+            token_usage = dict(result.usage) if result.usage else None
+
             if result.stop_reason == "tool_error":
                 status.tool_events = list(result.tool_events)
                 await self._announce_result(
-                    task_id, label, task,
-                    self._format_partial_progress(result),
-                    origin, "error",
+                    task_id=task_id, label=label, task=task,
+                    result=self._format_partial_progress(result),
+                    origin=origin, status="failed",
+                    duration_ms=duration_ms, token_usage=token_usage,
                 )
             elif result.stop_reason == "error":
                 await self._announce_result(
-                    task_id, label, task,
-                    result.error or "Error: subagent execution failed.",
-                    origin, "error",
+                    task_id=task_id, label=label, task=task,
+                    result=result.error or "Error: subagent execution failed.",
+                    origin=origin, status="failed",
+                    duration_ms=duration_ms, token_usage=token_usage,
                 )
             else:
                 final_result = result.final_content or "Task completed but no final response was generated."
                 logger.info("Subagent [{}] completed successfully", task_id)
-                await self._announce_result(task_id, label, task, final_result, origin, "ok")
+                await self._announce_result(
+                    task_id=task_id, label=label, task=task,
+                    result=final_result, origin=origin, status="completed",
+                    duration_ms=duration_ms, token_usage=token_usage,
+                )
 
         except Exception as e:
             status.phase = "error"
             status.error = str(e)
+            duration_ms = int((time.monotonic() - status.started_at) * 1000)
             logger.error("Subagent [{}] failed: {}", task_id, e)
-            await self._announce_result(task_id, label, task, f"Error: {e}", origin, "error")
+            await self._announce_result(
+                task_id=task_id, label=label, task=task,
+                result=f"Error: {e}", origin=origin, status="failed",
+                duration_ms=duration_ms, token_usage=None,
+            )
 
     async def _announce_result(
         self,
+        *,
         task_id: str,
         label: str,
         task: str,
         result: str,
         origin: dict[str, str],
         status: str,
+        duration_ms: int,
+        token_usage: dict[str, int] | None,
     ) -> None:
-        """Announce the subagent result to the main agent via the message bus."""
-        status_text = "completed successfully" if status == "ok" else "failed"
+        """Publish the subagent result back to the main agent's bus.
 
-        announce_content = render_template(
-            "agent/subagent_announce.md",
-            label=label,
-            status_text=status_text,
-            task=task,
-            result=result,
-        )
+        The result is published as an InboundMessage carrying structured
+        metadata under ``metadata["type"] == "subagent_result"``. The main
+        agent's dispatch path branches on that type to route the result
+        through the proper subagent-result handling (persistence + projection
+        at LLM-context-build time) instead of treating it as a regular user
+        message.
 
-        # Inject as system message to trigger main agent.
-        # sender_id="subagent" lets the dispatch path identify this as a
-        # subagent result and persist it with the correct role.
-        # Use session_key_override to align with the main agent's effective
-        # session key (which accounts for unified sessions) so the result is
-        # routed to the correct pending queue (mid-turn injection) instead of
-        # being dispatched as a competing independent task.
+        ``content`` carries the raw subagent output text; the formatted
+        announcement that the LLM eventually sees is rendered later by
+        ``ContextBuilder._project_history`` from the structured fields, so
+        we don't store pre-rendered text on disk.
+        """
         override = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         msg = InboundMessage(
-            channel="system",
+            channel=origin["channel"],
             sender_id="subagent",
-            chat_id=f"{origin['channel']}:{origin['chat_id']}",
-            content=announce_content,
+            chat_id=origin["chat_id"],
+            content=result,
             session_key_override=override,
             metadata={
-                "injected_event": "subagent_result",
-                "subagent_task_id": task_id,
+                "type": "subagent_result",
+                "task_id": task_id,
+                "label": label,
+                "status": status,
+                "duration_ms": duration_ms,
+                "result_task": task,
+                "token_usage": token_usage,
             },
         )
 
         await self.bus.publish_inbound(msg)
-        logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
+        logger.debug(
+            "Subagent [{}] announced result to {}:{} (status={}, duration={}ms)",
+            task_id, origin['channel'], origin['chat_id'], status, duration_ms,
+        )
 
     @staticmethod
     def _format_partial_progress(result) -> str:

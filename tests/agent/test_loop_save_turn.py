@@ -768,6 +768,7 @@ def test_set_tool_context_passes_thread_session_key_to_spawn(tmp_path: Path) -> 
     loop._set_tool_context(
         "slack",
         "C123",
+        message_id="msg-123",
         metadata={"slack": {"thread_ts": "1700.42", "channel_type": "channel"}},
         session_key="slack:C123:1700.42",
     )
@@ -775,6 +776,7 @@ def test_set_tool_context_passes_thread_session_key_to_spawn(tmp_path: Path) -> 
     spawn_tool = loop.tools.get("spawn")
     assert spawn_tool is not None
     assert spawn_tool._session_key.get() == "slack:C123:1700.42"
+    assert spawn_tool._origin_message_id.get() == "msg-123"
 
 
 @pytest.mark.asyncio
@@ -811,6 +813,7 @@ async def test_subagent_followup_uses_thread_session_and_slack_metadata(tmp_path
                 "type": "subagent_result",
                 "task_id": "sub-1",
                 "status": "completed",
+                "origin_message_id": "msg-123",
             },
         )
     )
@@ -818,7 +821,10 @@ async def test_subagent_followup_uses_thread_session_and_slack_metadata(tmp_path
     assert outbound is not None
     assert outbound.channel == "slack"
     assert outbound.chat_id == "C123"
-    assert outbound.metadata == {"slack": {"thread_ts": "1700.42"}}
+    assert outbound.metadata == {
+        "slack": {"thread_ts": "1700.42"},
+        "origin_message_id": "msg-123",
+    }
     assert "thread question" in seen["initial_messages"][1]["content"]
 
     loop.sessions.invalidate("slack:C123:1700.42")

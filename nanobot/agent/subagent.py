@@ -13,10 +13,15 @@ from loguru import logger
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
-from nanobot.agent.tools.defaults import build_default_tools
+from nanobot.agent.tools.file_state import FileStates
+from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.search import GlobTool, GrepTool
+from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import ExecToolConfig, WebToolsConfig
+from nanobot.config.schema import AgentDefaults, ExecToolConfig, WebToolsConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.utils.prompt_templates import render_template
 
@@ -77,6 +82,7 @@ class SubagentManager:
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
+        max_iterations: int | None = None,
     ):
         self.provider = provider
         self.workspace = workspace
@@ -87,6 +93,11 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
+        self.max_iterations = (
+            max_iterations
+            if max_iterations is not None
+            else AgentDefaults().max_tool_iterations
+        )
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
@@ -104,6 +115,7 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        origin_message_id: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -119,7 +131,7 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status)
+            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -145,6 +157,7 @@ class SubagentManager:
         label: str,
         origin: dict[str, str],
         status: SubagentStatus,
+        origin_message_id: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -160,13 +173,40 @@ class SubagentManager:
             # background workers, not user-facing.
             allowed_dir = self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
             extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            tools = build_default_tools(
-                self.workspace,
-                exec_config=self.exec_config,
-                web_config=self.web_config,
-                restrict_to_workspace=self.restrict_to_workspace,
-                extra_read_dirs=extra_read,
-            )
+            # Subagent gets its own FileStates so its read-dedup cache is
+            # isolated from the parent loop's sessions (issue #3571).
+            file_states = FileStates()
+            tools = ToolRegistry()
+            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read, file_states=file_states))
+            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
+            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
+            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
+            tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
+            tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
+            if self.exec_config.enable:
+                tools.register(ExecTool(
+                    working_dir=str(self.workspace),
+                    timeout=self.exec_config.timeout,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                    sandbox=self.exec_config.sandbox,
+                    path_append=self.exec_config.path_append,
+                    allowed_env_keys=self.exec_config.allowed_env_keys,
+                ))
+            if self.web_config.enable:
+                tools.register(
+                    WebSearchTool(
+                        config=self.web_config.search,
+                        proxy=self.web_config.proxy,
+                        user_agent=self.web_config.user_agent,
+                    )
+                )
+                tools.register(
+                    WebFetchTool(
+                        config=self.web_config.fetch,
+                        proxy=self.web_config.proxy,
+                        user_agent=self.web_config.user_agent,
+                    )
+                )
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -177,7 +217,7 @@ class SubagentManager:
                 initial_messages=messages,
                 tools=tools,
                 model=self.model,
-                max_iterations=15,
+                max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=_SubagentHook(task_id, status),
                 max_iterations_message="Task completed but no final response was generated.",
@@ -198,6 +238,7 @@ class SubagentManager:
                     result=self._format_partial_progress(result),
                     origin=origin, status="failed",
                     duration_ms=duration_ms, token_usage=token_usage,
+                    origin_message_id=origin_message_id,
                 )
             elif result.stop_reason == "error":
                 await self._announce_result(
@@ -205,6 +246,7 @@ class SubagentManager:
                     result=result.error or "Error: subagent execution failed.",
                     origin=origin, status="failed",
                     duration_ms=duration_ms, token_usage=token_usage,
+                    origin_message_id=origin_message_id,
                 )
             else:
                 final_result = result.final_content or "Task completed but no final response was generated."
@@ -213,6 +255,7 @@ class SubagentManager:
                     task_id=task_id, label=label, task=task,
                     result=final_result, origin=origin, status="completed",
                     duration_ms=duration_ms, token_usage=token_usage,
+                    origin_message_id=origin_message_id,
                 )
 
         except Exception as e:
@@ -224,6 +267,7 @@ class SubagentManager:
                 task_id=task_id, label=label, task=task,
                 result=f"Error: {e}", origin=origin, status="failed",
                 duration_ms=duration_ms, token_usage=None,
+                origin_message_id=origin_message_id,
             )
 
     async def _announce_result(
@@ -237,6 +281,7 @@ class SubagentManager:
         status: str,
         duration_ms: int,
         token_usage: dict[str, int] | None,
+        origin_message_id: str | None = None,
     ) -> None:
         """Publish the subagent result back to the main agent's bus.
 
@@ -267,6 +312,7 @@ class SubagentManager:
                 "duration_ms": duration_ms,
                 "result_task": task,
                 "token_usage": token_usage,
+                "origin_message_id": origin_message_id,
             },
         )
 

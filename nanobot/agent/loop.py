@@ -7,7 +7,7 @@ import dataclasses
 import json
 import os
 import time
-from contextlib import AsyncExitStack, nullcontext
+from contextlib import AsyncExitStack, nullcontext, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -28,12 +28,16 @@ from nanobot.agent.tools.ask import (
     pending_ask_user_id,
 )
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.defaults import build_default_tools
+from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
+from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -249,6 +253,9 @@ class AgentLoop:
                                       system_to_user_models=system_to_user_models)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        # One file-read/write tracker per logical session. The tool registry is
+        # shared by this loop, so tools resolve the active state via contextvars.
+        self._file_state_store = FileStateStore()
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -260,6 +267,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
+            max_iterations=self.max_iterations,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -310,6 +318,10 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+    def _sync_subagent_runtime_limits(self) -> None:
+        """Keep subagent runtime limits aligned with mutable loop settings."""
+        self.subagents.max_iterations = self.max_iterations
+
     def _apply_provider_snapshot(self, snapshot: ProviderSnapshot) -> None:
         """Swap model/provider for future turns without disturbing an active one."""
         provider = snapshot.provider
@@ -346,20 +358,45 @@ class AgentLoop:
             self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
         )
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-
-        # Filesystem / search / exec / web — shared with sub-agents via the
-        # build_default_tools helper. Main-only tools are registered below.
-        build_default_tools(
-            self.workspace,
-            exec_config=self.exec_config,
-            web_config=self.web_config,
-            restrict_to_workspace=self.restrict_to_workspace,
-            extra_read_dirs=extra_read,
-            registry=self.tools,
-        )
-
         self.tools.register(AskUserTool())
+        self.tools.register(
+            ReadFileTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=extra_read,
+            )
+        )
+        for cls in (WriteFileTool, EditFileTool, ListDirTool):
+            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        for cls in (GlobTool, GrepTool):
+            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        if self.exec_config.enable:
+            self.tools.register(
+                ExecTool(
+                    working_dir=str(self.workspace),
+                    timeout=self.exec_config.timeout,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                    sandbox=self.exec_config.sandbox,
+                    path_append=self.exec_config.path_append,
+                    allowed_env_keys=self.exec_config.allowed_env_keys,
+                )
+            )
+        if self.web_config.enable:
+            self.tools.register(
+                WebSearchTool(
+                    config=self.web_config.search,
+                    proxy=self.web_config.proxy,
+                    user_agent=self.web_config.user_agent,
+                )
+            )
+            self.tools.register(
+                WebFetchTool(
+                    config=self.web_config.fetch,
+                    proxy=self.web_config.proxy,
+                    user_agent=self.web_config.user_agent,
+                )
+            )
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound, workspace=self.workspace))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
@@ -410,6 +447,8 @@ class AgentLoop:
                 if hasattr(tool, "set_context"):
                     if name == "spawn":
                         tool.set_context(channel, chat_id, effective_key=effective_key)
+                        if hasattr(tool, "set_origin_message_id"):
+                            tool.set_origin_message_id(message_id)
                     elif name == "cron":
                         tool.set_context(channel, chat_id, metadata=metadata, session_key=session_key)
                     elif name == "message":
@@ -461,10 +500,8 @@ class AgentLoop:
         tasks = self._active_tasks.pop(key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
-            try:
+            with suppress(asyncio.CancelledError, Exception):
                 await t
-            except (asyncio.CancelledError, Exception):
-                pass
         sub_cancelled = await self.subagents.cancel_by_session(key)
         return cancelled + sub_cancelled
 
@@ -511,6 +548,8 @@ class AgentLoop:
 
         Returns (final_content, tools_used, messages, stop_reason, had_injections).
         """
+        self._sync_subagent_runtime_limits()
+
         loop_hook = _LoopHook(
             self,
             on_progress=on_progress,
@@ -555,6 +594,7 @@ class AgentLoop:
                 # recognises them as task completions.
                 if metadata.get("type") == "subagent_result":
                     from nanobot.agent.context import _subagent_status_text
+                    from nanobot.utils.prompt_templates import render_template
                     rendered = render_template(
                         "agent/subagent_announce.md",
                         label=metadata.get("label") or "subagent",
@@ -589,25 +629,30 @@ class AgentLoop:
                     break
             return items
 
-        result = await self.runner.run(AgentRunSpec(
-            initial_messages=initial_messages,
-            tools=self.tools,
-            model=self.model,
-            max_iterations=self.max_iterations,
-            max_tool_result_chars=self.max_tool_result_chars,
-            hook=hook,
-            error_message="Sorry, I encountered an error calling the AI model.",
-            concurrent_tools=True,
-            workspace=self.workspace,
-            session_key=session.key if session else None,
-            context_window_tokens=self.context_window_tokens,
-            context_block_limit=self.context_block_limit,
-            provider_retry_mode=self.provider_retry_mode,
-            progress_callback=on_progress,
-            retry_wait_callback=on_retry_wait,
-            checkpoint_callback=_checkpoint,
-            injection_callback=_drain_pending,
-        ))
+        active_session_key = session.key if session else session_key
+        file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
+        try:
+            result = await self.runner.run(AgentRunSpec(
+                initial_messages=initial_messages,
+                tools=self.tools,
+                model=self.model,
+                max_iterations=self.max_iterations,
+                max_tool_result_chars=self.max_tool_result_chars,
+                hook=hook,
+                error_message="Sorry, I encountered an error calling the AI model.",
+                concurrent_tools=True,
+                workspace=self.workspace,
+                session_key=session.key if session else None,
+                context_window_tokens=self.context_window_tokens,
+                context_block_limit=self.context_block_limit,
+                provider_retry_mode=self.provider_retry_mode,
+                progress_callback=on_progress,
+                retry_wait_callback=on_retry_wait,
+                checkpoint_callback=_checkpoint,
+                injection_callback=_drain_pending,
+            ))
+        finally:
+            reset_file_states(file_state_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -909,6 +954,7 @@ class AgentLoop:
                 chat_id=self._runtime_chat_id(msg),
                 model=self.model,
                 task_summary=task_summary or None,
+                sender_id=msg.sender_id,
             )
 
         async def _bus_progress(
@@ -1206,6 +1252,7 @@ class AgentLoop:
             current_role="user",
             model=self.model,
             task_summary=task_summary or None,
+            sender_id=msg.sender_id,
         )
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
             messages, session=session, channel=channel, chat_id=chat_id,

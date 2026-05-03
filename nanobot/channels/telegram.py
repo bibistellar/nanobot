@@ -287,6 +287,7 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._turn_message_ids: dict[str, int] = {}  # chat_id -> message_id for tool hint edits
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -565,6 +566,20 @@ class TelegramChannel(BaseChannel):
         # Send text content
         if msg.content and msg.content != "[empty message]":
             render_as_blockquote = bool(msg.metadata.get("_tool_hint"))
+            is_progress = bool(msg.metadata.get("_progress"))
+
+            # Tool hints and progress messages edit the turn's existing
+            # message (or create one if it doesn't exist yet) so the chat
+            # stays clean — only one message per turn, continuously updated.
+            if is_progress and render_as_blockquote:
+                await self._edit_or_create_turn_message(
+                    msg.chat_id, chat_id, msg.content,
+                    thread_kwargs=thread_kwargs,
+                    reply_params=reply_params,
+                    blockquote=True,
+                )
+                return
+
             buttons = getattr(msg, "buttons", None) or []
             force_kb = bool(msg.metadata.get("_system_buttons"))
             reply_markup = self._build_keyboard(buttons, force=force_kb) if buttons else None
@@ -640,6 +655,75 @@ class TelegramChannel(BaseChannel):
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)
                 raise
+
+    async def _edit_or_create_turn_message(
+        self,
+        str_chat_id: str,
+        int_chat_id: int,
+        text: str,
+        *,
+        thread_kwargs: dict | None = None,
+        reply_params=None,
+        blockquote: bool = False,
+    ) -> None:
+        """Edit the current turn's message, or create one if none exists.
+
+        Used for tool hints and progress updates so the entire turn uses
+        a single Telegram message that is continuously updated.
+        """
+        truncated = text[:TELEGRAM_MAX_MESSAGE_LEN] if len(text) > TELEGRAM_MAX_MESSAGE_LEN else text
+        html = _tool_hint_to_telegram_blockquote(truncated) if blockquote else _markdown_to_telegram_html(truncated)
+
+        msg_id = self._turn_message_ids.get(str_chat_id)
+        if msg_id:
+            try:
+                await self._call_with_retry(
+                    self._app.bot.edit_message_text,
+                    chat_id=int_chat_id,
+                    message_id=msg_id,
+                    text=html,
+                    parse_mode="HTML",
+                )
+                return
+            except BadRequest as e:
+                if self._is_not_modified_error(e):
+                    return
+                # Edit failed (maybe message too old), fall through to send new
+                logger.debug("Turn message edit failed, sending new: {}", e)
+
+        # Create new turn message
+        try:
+            sent = await self._call_with_retry(
+                self._app.bot.send_message,
+                chat_id=int_chat_id,
+                text=html,
+                parse_mode="HTML",
+                reply_parameters=reply_params,
+                **(thread_kwargs or {}),
+            )
+            if sent and sent.message_id:
+                self._turn_message_ids[str_chat_id] = sent.message_id
+                # Also seed the stream buffer so streaming continues on this message
+                buf = self._stream_bufs.get(str_chat_id)
+                if buf is None:
+                    buf = _StreamBuf(stream_id=None)
+                    self._stream_bufs[str_chat_id] = buf
+                buf.message_id = sent.message_id
+        except BadRequest:
+            # HTML failed, try plain
+            sent = await self._call_with_retry(
+                self._app.bot.send_message,
+                chat_id=int_chat_id,
+                text=truncated,
+                reply_parameters=reply_params,
+                **(thread_kwargs or {}),
+            )
+            if sent and sent.message_id:
+                self._turn_message_ids[str_chat_id] = sent.message_id
+
+    def clear_turn_message(self, chat_id: str) -> None:
+        """Clear the turn message tracker when a new user message arrives."""
+        self._turn_message_ids.pop(chat_id, None)
 
     @staticmethod
     def _is_not_modified_error(exc: Exception) -> bool:
@@ -717,12 +801,11 @@ class TelegramChannel(BaseChannel):
                     # Fall back to _send_text which handles HTML→plain gracefully.
                     await self._send_text(int_chat_id, extra_html_chunk)
             if meta.get("_resuming"):
-                # Keep message_id so the next stream segment edits the same
-                # Telegram message instead of creating a duplicate.
                 buf.text = ""
-                buf.stream_id = None  # accept any next stream_id
+                buf.stream_id = None
             else:
                 self._stream_bufs.pop(chat_id, None)
+                self._turn_message_ids.pop(chat_id, None)
             return
 
         buf = self._stream_bufs.get(chat_id)
@@ -741,18 +824,34 @@ class TelegramChannel(BaseChannel):
         if message_thread_id := meta.get("message_thread_id"):
             thread_kwargs["message_thread_id"] = message_thread_id
         if buf.message_id is None:
-            preview = _strip_md_block(buf.text)
-            try:
-                sent = await self._call_with_retry(
-                    self._app.bot.send_message,
-                    chat_id=int_chat_id, text=preview,
-                    **thread_kwargs,
-                )
-                buf.message_id = sent.message_id
+            # Reuse the turn message if one exists (created by tool hint)
+            turn_msg_id = self._turn_message_ids.get(chat_id)
+            if turn_msg_id:
+                buf.message_id = turn_msg_id
                 buf.last_edit = now
-            except Exception as e:
-                logger.warning("Stream initial send failed: {}", e)
-                raise  # Let ChannelManager handle retry
+                # Immediately edit with streaming content
+                preview = _strip_md_block(buf.text)
+                with suppress(Exception):
+                    await self._call_with_retry(
+                        self._app.bot.edit_message_text,
+                        chat_id=int_chat_id, message_id=buf.message_id,
+                        text=preview,
+                    )
+            else:
+                preview = _strip_md_block(buf.text)
+                try:
+                    sent = await self._call_with_retry(
+                        self._app.bot.send_message,
+                        chat_id=int_chat_id, text=preview,
+                        **thread_kwargs,
+                    )
+                    buf.message_id = sent.message_id
+                    buf.last_edit = now
+                    # Track as turn message so tool hints can edit it too
+                    self._turn_message_ids[chat_id] = sent.message_id
+                except Exception as e:
+                    logger.warning("Stream initial send failed: {}", e)
+                    raise  # Let ChannelManager handle retry
         elif (now - buf.last_edit) >= self.config.stream_edit_interval:
             if len(buf.text) > TELEGRAM_MAX_MESSAGE_LEN:
                 await self._flush_stream_overflow(int_chat_id, buf, thread_kwargs)
@@ -1017,6 +1116,7 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         self._remember_thread_context(message)
+        self.clear_turn_message(str(message.chat_id))
 
         # Strip @bot_username suffix if present
         content = message.text or ""
@@ -1044,6 +1144,10 @@ class TelegramChannel(BaseChannel):
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
         self._remember_thread_context(message)
+
+        # New user message → lock the current turn message, next bot reply
+        # will create a fresh message.
+        self.clear_turn_message(str(chat_id))
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id

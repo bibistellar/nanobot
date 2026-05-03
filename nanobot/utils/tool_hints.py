@@ -92,19 +92,40 @@ def _fmt_known(tc, fmt: tuple) -> str:
     return fmt[1].format(val)
 
 
-def _abbreviate_command(cmd: str, max_len: int = 40) -> str:
-    """Abbreviate paths in a command string, then truncate."""
+_SSH_CMD_RE = re.compile(
+    r"""ssh\s+(?:-\S+\s+)*\S+@\S+\s+['"](.+?)['"]$""",
+    re.DOTALL,
+)
+
+
+def _abbreviate_command(cmd: str, max_len: int = 120) -> str:
+    """Abbreviate a command string for display.
+
+    For SSH-wrapped commands, extract the remote command portion so the
+    user sees what's actually being executed rather than the SSH prefix.
+    """
+    display = cmd.strip()
+
+    # Extract the inner command from ssh ... 'inner command'
+    m = _SSH_CMD_RE.search(display)
+    if m:
+        inner = m.group(1).strip()
+        # Collapse multi-line scripts to first meaningful line
+        lines = [l.strip() for l in inner.splitlines() if l.strip() and not l.strip().startswith('#')]
+        display = lines[0] if lines else inner
+        display = f"[ssh] {display}"
+
     def _replace_path(match: re.Match[str]) -> str:
         if match.group("double") is not None:
-            return f'"{abbreviate_path(match.group("double"), max_len=25)}"'
+            return f'"{abbreviate_path(match.group("double"), max_len=30)}"'
         if match.group("single") is not None:
-            return f"'{abbreviate_path(match.group('single'), max_len=25)}'"
-        return abbreviate_path(match.group("bare"), max_len=25)
+            return f"'{abbreviate_path(match.group('single'), max_len=30)}'"
+        return abbreviate_path(match.group("bare"), max_len=30)
 
-    abbreviated = _PATH_IN_CMD_RE.sub(_replace_path, cmd)
-    if len(abbreviated) <= max_len:
-        return abbreviated
-    return abbreviated[:max_len - 1] + "\u2026"
+    display = _PATH_IN_CMD_RE.sub(_replace_path, display)
+    if len(display) <= max_len:
+        return display
+    return display[:max_len - 1] + "\u2026"
 
 
 def _fmt_mcp(tc) -> str:

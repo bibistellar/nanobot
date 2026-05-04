@@ -68,12 +68,10 @@ class ContextBuilder:
         if self.dashscope:
             parts.append(
                 "# Memory\n\n"
-                "You have a long-term memory store (Dashscope). Relevant memories are "
+                "You have a long-term memory store. Relevant memories are "
                 "automatically retrieved and shown in [Long-term Memory] blocks "
                 "before the user's message. You can also proactively search or "
                 "add memories using the memory-manage skill when needed.\n\n"
-                "Do NOT write memory content to MEMORY.md — use the memory-manage "
-                "skill to persist important information to the cloud memory store.\n\n"
                 "For routine task logs (health checks, image upgrades, upstream sync), "
                 "write results to `memory/task_log.md` with timestamps. Keep only the "
                 "last 7 days of entries."

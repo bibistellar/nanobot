@@ -738,10 +738,17 @@ def _run_gateway(
         if isinstance(message_tool, MessageTool):
             message_record_token = message_tool.set_record_channel_delivery(True)
 
+        # Clear cron session before each run so the LLM starts with a
+        # clean context and cannot "reuse" stale results from previous runs.
+        cron_session_key = f"cron:{job.id}"
+        cron_session = agent.sessions.get_or_create(cron_session_key)
+        cron_session.clear()
+        agent.sessions.save(cron_session)
+
         try:
             resp = await agent.process_direct(
                 reminder_note,
-                session_key=f"cron:{job.id}",
+                session_key=cron_session_key,
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
                 on_progress=_silent,

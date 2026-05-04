@@ -62,20 +62,18 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        # Short-term memory (local MEMORY.md)
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Short-term Memory\n\n{memory}")
-
-        # Long-term memory hint (actual retrieval happens in build_messages
-        # using the user's current message as the search query).
+        # Long-term memory is managed entirely by Dashscope. Relevant
+        # memories are retrieved per-message in build_messages() and injected
+        # as [Long-term Memory] blocks. MEMORY.md is no longer used.
         if self.dashscope:
             parts.append(
-                "# Long-term Memory\n\n"
-                "You have a long-term memory store. Relevant memories are "
+                "# Memory\n\n"
+                "You have a long-term memory store (Dashscope). Relevant memories are "
                 "automatically retrieved and shown in [Long-term Memory] blocks "
                 "before the user's message. You can also proactively search or "
-                "add memories using the memory-manage skill when needed."
+                "add memories using the memory-manage skill when needed.\n\n"
+                "Do NOT write memory content to MEMORY.md — use the memory-manage "
+                "skill to persist important information to the cloud memory store."
             )
 
         always_skills = self.skills.get_always_skills()

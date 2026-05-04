@@ -926,55 +926,11 @@ class Dream:
             logger.exception("Dream Phase 1 failed")
             return False
 
-        # Phase 2: Delegate to AgentRunner with read_file / edit_file
-        existing_skills = self._list_existing_skills()
-        skills_section = ""
-        if existing_skills:
-            skills_section = (
-                "\n\n## Existing Skills\n"
-                + "\n".join(f"- {s}" for s in existing_skills)
-            )
-        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
-
-        tools = self._tools
-        skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": render_template(
-                    "agent/dream_phase2.md",
-                    strip=True,
-                    skill_creator_path=str(skill_creator_path),
-                ),
-            },
-            {"role": "user", "content": phase2_prompt},
-        ]
-
-        try:
-            result = await self._runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                fail_on_tool_error=False,
-            ))
-            logger.debug(
-                "Dream Phase 2 complete: stop_reason={}, tool_events={}",
-                result.stop_reason, len(result.tool_events),
-            )
-            for ev in (result.tool_events or []):
-                logger.info("Dream tool_event: name={}, status={}, detail={}", ev.get("name"), ev.get("status"), ev.get("detail", "")[:200])
-        except Exception:
-            logger.exception("Dream Phase 2 failed")
-            result = None
-
-        # Build changelog from tool events
+        # Phase 2 (Dashscope-only): Skip local MEMORY.md rewrite. Long-term
+        # memory is managed entirely by Dashscope. The Phase 1 analysis is
+        # synced to Dashscope below along with the raw batch entries.
+        result = None
         changelog: list[str] = []
-        if result and result.tool_events:
-            for event in result.tool_events:
-                if event["status"] == "ok":
-                    changelog.append(f"{event['name']}: {event['detail']}")
 
         # Advance cursor — always, to avoid re-processing Phase 1
         new_cursor = batch[-1]["cursor"]
@@ -1002,7 +958,9 @@ class Dream:
             if sha:
                 logger.info("Dream commit: {}", sha)
 
-        # Sync to Dashscope long-term memory (short-term → long-term consolidation)
+        # Sync to Dashscope long-term memory. Send the Phase 1 analysis
+        # (LLM-curated summary) as an assistant message so Dashscope extracts
+        # high-quality facts, plus the raw batch entries as user context.
         if self.dashscope and batch:
             try:
                 messages = []
@@ -1010,9 +968,11 @@ class Dream:
                     content = entry.get("content", "")
                     if content:
                         messages.append({"role": "user", "content": content})
+                if analysis:
+                    messages.append({"role": "assistant", "content": analysis})
                 if messages:
                     self.dashscope.add_memory(messages)
-                    logger.info("Dream: synced {} entries to Dashscope long-term memory", len(messages))
+                    logger.info("Dream: synced {} entries + analysis to Dashscope", len(messages))
             except Exception as e:
                 logger.warning("Dream: Dashscope sync failed: {}", e)
 

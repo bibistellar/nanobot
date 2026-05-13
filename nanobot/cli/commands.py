@@ -651,6 +651,7 @@ def _run_gateway(
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
+    from nanobot.cron.system_events import get_system_event, register_system_event
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
@@ -743,13 +744,18 @@ def _run_gateway(
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
-        # Dream is an internal job — run directly, not through the agent loop.
-        if job.name == "dream":
+        # System-event jobs (kind="system_event") bypass the agent loop and
+        # dispatch to a registered handler keyed by job.name.
+        if job.payload.kind == "system_event":
+            handler = get_system_event(job.name)
+            if handler is None:
+                logger.warning("Cron: no system_event handler registered for {}", job.name)
+                return None
             try:
-                await agent.dream.run()
-                logger.info("Dream cron job completed")
+                await handler(agent, job)
+                logger.info("System event '{}' completed", job.name)
             except Exception:
-                logger.exception("Dream cron job failed")
+                logger.exception("System event '{}' failed", job.name)
             return None
 
         from nanobot.utils.evaluator import evaluate_response
@@ -962,6 +968,11 @@ def _run_gateway(
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
     from nanobot.cron.types import CronJob, CronPayload
+
+    async def _run_dream(agent_, _job):
+        await agent_.dream.run()
+
+    register_system_event("dream", _run_dream)
     cron.register_system_job(CronJob(
         id="dream",
         name="dream",

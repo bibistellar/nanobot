@@ -396,8 +396,8 @@ def test_add_job_captures_metadata_and_session_key(tmp_path) -> None:
 
     jobs = tool._cron.list_jobs()
     assert len(jobs) == 1
-    assert jobs[0].payload.channel_meta == meta
-    assert jobs[0].payload.session_key == "slack:C99:111.222"
+    assert jobs[0].payload.deliver_meta == meta
+    assert jobs[0].payload.origin_session_key == "slack:C99:111.222"
 
 
 def test_list_excludes_disabled_jobs(tmp_path) -> None:

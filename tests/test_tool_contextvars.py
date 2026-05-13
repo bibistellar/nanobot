@@ -114,8 +114,8 @@ async def test_cron_tool_keeps_task_local_context(tmp_path) -> None:
     assert result_two.startswith("Created job")
 
     jobs = tool._cron.list_jobs()
-    assert {job.payload.channel for job in jobs} == {"feishu", "email"}
-    assert {job.payload.to for job in jobs} == {"chat-a", "chat-b"}
+    assert {job.payload.origin_channel for job in jobs} == {"feishu", "email"}
+    assert {job.payload.origin_chat_id for job in jobs} == {"chat-a", "chat-b"}
 
 
 # --- Basic single-task regression tests ---
@@ -229,8 +229,8 @@ async def test_cron_tool_basic_set_context_and_execute(tmp_path) -> None:
 
     jobs = tool._cron.list_jobs()
     assert len(jobs) == 1
-    assert jobs[0].payload.channel == "wechat"
-    assert jobs[0].payload.to == "user-789"
+    assert jobs[0].payload.origin_channel == "wechat"
+    assert jobs[0].payload.origin_chat_id == "user-789"
 
 
 @pytest.mark.asyncio

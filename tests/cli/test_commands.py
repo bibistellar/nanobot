@@ -1197,12 +1197,12 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     job = CronJob(
         id="cron-1",
         name="stretch",
-        payload=CronPayload(
-            message="Remind me to stretch.",
-            deliver=True,
-            channel="telegram",
-            to="user-1",
-        ),
+        payload=CronPayload.from_dict({
+            "message": "Remind me to stretch.",
+            "deliver": True,
+            "channel": "telegram",
+            "to": "user-1",
+        }),
     )
 
     response = asyncio.run(cron.on_job(job))
@@ -1321,12 +1321,12 @@ def test_gateway_cron_job_suppresses_intermediate_progress(
     job = CronJob(
         id="cron-silent-test",
         name="test-silent",
-        payload=CronPayload(
-            message="Run something.",
-            deliver=True,
-            channel="telegram",
-            to="user-1",
-        ),
+        payload=CronPayload.from_dict({
+            "message": "Run something.",
+            "deliver": True,
+            "channel": "telegram",
+            "to": "user-1",
+        }),
     )
     response = asyncio.run(cron.on_job(job))
 

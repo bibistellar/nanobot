@@ -124,19 +124,23 @@ class CronService:
                             expr=j["schedule"].get("expr"),
                             tz=j["schedule"].get("tz"),
                         ),
-                        payload=CronPayload(
-                            kind=j["payload"].get("kind", "agent_turn"),
-                            message=j["payload"].get("message", ""),
-                            deliver=j["payload"].get("deliver", False),
-                            channel=j["payload"].get("channel"),
-                            to=j["payload"].get("to"),
-                            channel_meta=(
-                                j["payload"].get("channelMeta")
-                                or j["payload"].get("channel_meta")
-                                or {}
-                            ),
-                            session_key=j["payload"].get("sessionKey") or j["payload"].get("session_key"),
-                        ),
+                        payload=CronPayload.from_dict({
+                            "kind": j["payload"].get("kind", "agent_turn"),
+                            "message": j["payload"].get("message", ""),
+                            "deliver": j["payload"].get("deliver", True),
+                            # New field names (with camelCase aliases for JSON)
+                            "deliver_channel": j["payload"].get("deliverChannel") or j["payload"].get("deliver_channel"),
+                            "deliver_chat_id": j["payload"].get("deliverChatId") or j["payload"].get("deliver_chat_id"),
+                            "deliver_meta": j["payload"].get("deliverMeta") or j["payload"].get("deliver_meta") or {},
+                            "origin_channel": j["payload"].get("originChannel") or j["payload"].get("origin_channel"),
+                            "origin_chat_id": j["payload"].get("originChatId") or j["payload"].get("origin_chat_id"),
+                            "origin_session_key": j["payload"].get("originSessionKey") or j["payload"].get("origin_session_key"),
+                            # Legacy field names — from_dict translates these.
+                            "channel": j["payload"].get("channel"),
+                            "to": j["payload"].get("to"),
+                            "channel_meta": j["payload"].get("channelMeta") or j["payload"].get("channel_meta"),
+                            "session_key": j["payload"].get("sessionKey") or j["payload"].get("session_key"),
+                        }),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
                             last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
@@ -262,10 +266,12 @@ class CronService:
                         "kind": j.payload.kind,
                         "message": j.payload.message,
                         "deliver": j.payload.deliver,
-                        "channel": j.payload.channel,
-                        "to": j.payload.to,
-                        "channelMeta": j.payload.channel_meta,
-                        "sessionKey": j.payload.session_key,
+                        "deliverChannel": j.payload.deliver_channel,
+                        "deliverChatId": j.payload.deliver_chat_id,
+                        "deliverMeta": j.payload.deliver_meta,
+                        "originChannel": j.payload.origin_channel,
+                        "originChatId": j.payload.origin_chat_id,
+                        "originSessionKey": j.payload.origin_session_key,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -479,15 +485,35 @@ class CronService:
         schedule: CronSchedule,
         message: str,
         deliver: bool = False,
+        delete_after_run: bool = False,
+        # Legacy combined params (channel == both origin and deliver target).
+        # When passed, origin_* and deliver_* default to these.
         channel: str | None = None,
         to: str | None = None,
-        delete_after_run: bool = False,
         channel_meta: dict | None = None,
         session_key: str | None = None,
+        # New explicit params.
+        origin_channel: str | None = None,
+        origin_chat_id: str | None = None,
+        origin_session_key: str | None = None,
+        deliver_channel: str | None = None,
+        deliver_chat_id: str | None = None,
+        deliver_meta: dict | None = None,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
         now = _now_ms()
+
+        # Legacy fallback: channel/to/channel_meta/session_key populate both
+        # origin and deliver fields when explicit values are not given.
+        resolved_origin_channel = origin_channel if origin_channel is not None else channel
+        resolved_origin_chat_id = origin_chat_id if origin_chat_id is not None else to
+        resolved_origin_session = origin_session_key if origin_session_key is not None else session_key
+        resolved_deliver_channel = deliver_channel if deliver_channel is not None else channel
+        resolved_deliver_chat_id = deliver_chat_id if deliver_chat_id is not None else to
+        resolved_deliver_meta = (
+            deliver_meta if deliver_meta is not None else (channel_meta or {})
+        )
 
         job = CronJob(
             id=str(uuid.uuid4())[:8],
@@ -498,10 +524,12 @@ class CronService:
                 kind="agent_turn",
                 message=message,
                 deliver=deliver,
-                channel=channel,
-                to=to,
-                channel_meta=channel_meta or {},
-                session_key=session_key,
+                deliver_channel=resolved_deliver_channel,
+                deliver_chat_id=resolved_deliver_chat_id,
+                deliver_meta=resolved_deliver_meta,
+                origin_channel=resolved_origin_channel,
+                origin_chat_id=resolved_origin_chat_id,
+                origin_session_key=resolved_origin_session,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
@@ -585,14 +613,19 @@ class CronService:
         schedule: CronSchedule | None = None,
         message: str | None = None,
         deliver: bool | None = None,
+        # Legacy: writes to both origin_* and deliver_*.
         channel: str | None = ...,
         to: str | None = ...,
+        # New explicit fields.
+        deliver_channel: str | None = ...,
+        deliver_chat_id: str | None = ...,
         delete_after_run: bool | None = None,
     ) -> CronJob | Literal["not_found", "protected"]:
         """Update mutable fields of an existing job. System jobs cannot be updated.
 
-        For ``channel`` and ``to``, pass an explicit value (including ``None``)
-        to update; omit (sentinel ``...``) to leave unchanged.
+        For optional channel/chat-id fields, pass an explicit value (including ``None``)
+        to update; omit (sentinel ``...``) to leave unchanged.  Legacy ``channel``/``to``
+        write to both origin_* and deliver_* for backward compatibility.
         """
         store = self._load_store()
         job = next((j for j in store.jobs if j.id == job_id), None)
@@ -611,9 +644,15 @@ class CronService:
         if deliver is not None:
             job.payload.deliver = deliver
         if channel is not ...:
-            job.payload.channel = channel
+            job.payload.origin_channel = channel
+            job.payload.deliver_channel = channel
         if to is not ...:
-            job.payload.to = to
+            job.payload.origin_chat_id = to
+            job.payload.deliver_chat_id = to
+        if deliver_channel is not ...:
+            job.payload.deliver_channel = deliver_channel
+        if deliver_chat_id is not ...:
+            job.payload.deliver_chat_id = deliver_chat_id
         if delete_after_run is not None:
             job.delete_after_run = delete_after_run
 

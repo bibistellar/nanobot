@@ -56,13 +56,13 @@ def test_add_job_preserves_channel_meta_and_session_key(tmp_path) -> None:
         channel_meta=meta,
         session_key="slack:C123:1234567890.123456",
     )
-    assert job.payload.channel_meta == meta
-    assert job.payload.session_key == "slack:C123:1234567890.123456"
+    assert job.payload.deliver_meta == meta
+    assert job.payload.origin_session_key == "slack:C123:1234567890.123456"
 
     reloaded = service.get_job(job.id)
     assert reloaded is not None
-    assert reloaded.payload.channel_meta == meta
-    assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
+    assert reloaded.payload.deliver_meta == meta
+    assert reloaded.payload.origin_session_key == "slack:C123:1234567890.123456"
 
 
 @pytest.mark.asyncio
@@ -87,13 +87,13 @@ async def test_channel_meta_and_session_key_survive_store_reload(tmp_path) -> No
 
     raw = json.loads(store_path.read_text(encoding="utf-8"))
     payload = raw["jobs"][0]["payload"]
-    assert payload["channelMeta"] == meta
-    assert payload["sessionKey"] == "slack:C123:1234567890.123456"
+    assert payload["deliverMeta"] == meta
+    assert payload["originSessionKey"] == "slack:C123:1234567890.123456"
 
     reloaded = CronService(store_path).get_job(job.id)
     assert reloaded is not None
-    assert reloaded.payload.channel_meta == meta
-    assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
+    assert reloaded.payload.deliver_meta == meta
+    assert reloaded.payload.origin_session_key == "slack:C123:1234567890.123456"
 
 
 @pytest.mark.asyncio
@@ -560,7 +560,10 @@ def test_update_job_offline_writes_action(tmp_path) -> None:
 
 
 def test_update_job_sentinel_channel_and_to(tmp_path) -> None:
-    """Passing None clears channel/to; omitting leaves them unchanged."""
+    """Passing None clears channel/to; omitting leaves them unchanged.
+
+    Legacy ``channel``/``to`` write both origin_* and deliver_* together.
+    """
     service = CronService(tmp_path / "cron" / "jobs.json")
     job = service.add_job(
         name="sentinel",
@@ -569,18 +572,22 @@ def test_update_job_sentinel_channel_and_to(tmp_path) -> None:
         channel="telegram",
         to="user123",
     )
-    assert job.payload.channel == "telegram"
-    assert job.payload.to == "user123"
+    assert job.payload.deliver_channel == "telegram"
+    assert job.payload.deliver_chat_id == "user123"
+    assert job.payload.origin_channel == "telegram"
+    assert job.payload.origin_chat_id == "user123"
 
     result = service.update_job(job.id, name="renamed")
     assert isinstance(result, CronJob)
-    assert result.payload.channel == "telegram"
-    assert result.payload.to == "user123"
+    assert result.payload.deliver_channel == "telegram"
+    assert result.payload.deliver_chat_id == "user123"
 
     result = service.update_job(job.id, channel=None, to=None)
     assert isinstance(result, CronJob)
-    assert result.payload.channel is None
-    assert result.payload.to is None
+    assert result.payload.deliver_channel is None
+    assert result.payload.deliver_chat_id is None
+    assert result.payload.origin_channel is None
+    assert result.payload.origin_chat_id is None
 
 
 @pytest.mark.asyncio

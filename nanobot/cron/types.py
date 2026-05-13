@@ -1,7 +1,7 @@
 """Cron types."""
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass
@@ -20,15 +20,67 @@ class CronSchedule:
 
 @dataclass
 class CronPayload:
-    """What to do when the job runs."""
+    """What to do when the job runs.
+
+    The payload distinguishes *origin* (where the job was created) from
+    *deliver target* (where the result should be sent).  A user can ask
+    in a group chat to schedule a task whose results should be delivered
+    to their DM — origin captures the former, deliver_* the latter.
+    """
     kind: Literal["system_event", "agent_turn"] = "agent_turn"
     message: str = ""
-    # Deliver response to channel
-    deliver: bool = False
-    channel: str | None = None  # e.g. "whatsapp"
-    to: str | None = None  # e.g. phone number
-    channel_meta: dict = field(default_factory=dict)  # channel-specific routing (e.g. Slack thread_ts)
-    session_key: str | None = None  # original session key for correct session recording
+    # Whether to forward the result to a user-visible channel at all.
+    deliver: bool = True
+
+    # Where to deliver the result.  When unset, falls back to origin_*.
+    deliver_channel: str | None = None
+    deliver_chat_id: str | None = None
+    deliver_meta: dict = field(default_factory=dict)  # platform routing (e.g. Slack thread_ts)
+
+    # Where the job was originally created.  Used as deliver fallback and as
+    # session context for the main agent's deliver decision.
+    origin_channel: str | None = None
+    origin_chat_id: str | None = None
+    origin_session_key: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CronPayload":
+        """Construct a CronPayload, mapping legacy fields to the new schema.
+
+        Legacy fields ``channel``/``to``/``channel_meta``/``session_key`` are
+        mapped into ``origin_*`` (they always described the creation context)
+        and copied into ``deliver_*`` as the legacy delivery target.
+        """
+        data = dict(data)
+        legacy_channel = data.pop("channel", None)
+        legacy_to = data.pop("to", None)
+        legacy_meta = data.pop("channel_meta", None)
+        legacy_session = data.pop("session_key", None)
+
+        # Map legacy → origin_* (origin describes creation; we historically
+        # used these as both origin and delivery target).
+        data.setdefault("origin_channel", legacy_channel)
+        data.setdefault("origin_chat_id", legacy_to)
+        data.setdefault("origin_session_key", legacy_session)
+
+        # Map legacy → deliver_* so existing jobs keep delivering to the
+        # same place after the upgrade.
+        data.setdefault("deliver_channel", legacy_channel)
+        data.setdefault("deliver_chat_id", legacy_to)
+        if legacy_meta is not None and not data.get("deliver_meta"):
+            data["deliver_meta"] = legacy_meta
+
+        return cls(**data)
+
+    @property
+    def effective_deliver_channel(self) -> str | None:
+        """Channel to deliver to, falling back to origin_channel."""
+        return self.deliver_channel or self.origin_channel
+
+    @property
+    def effective_deliver_chat_id(self) -> str | None:
+        """Chat id to deliver to, falling back to origin_chat_id."""
+        return self.deliver_chat_id or self.origin_chat_id
 
 
 @dataclass
@@ -71,7 +123,7 @@ class CronJob:
             for record in state_kwargs.get("run_history", [])
         ]
         kwargs["schedule"] = CronSchedule(**kwargs.get("schedule", {"kind": "every"}))
-        kwargs["payload"] = CronPayload(**kwargs.get("payload", {}))
+        kwargs["payload"] = CronPayload.from_dict(kwargs.get("payload", {}))
         kwargs["state"] = CronJobState(**state_kwargs)
         return cls(**kwargs)
 

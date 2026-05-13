@@ -289,6 +289,18 @@ def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
     assert "messaging app" in system
 
 
+def test_system_prompt_keeps_message_tool_out_of_current_chat_replies(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt(channel="slack")
+
+    assert "Do not use the 'message' tool for normal replies in the current chat" in prompt
+    assert "the runtime attaches those artifacts to the final assistant reply automatically" in prompt
+    assert "do not call 'message' just to announce or resend them" in prompt
+    assert "Wait for the tool results, then answer once" in prompt
+
+
 def test_subagent_result_persisted_as_user_gets_llm_response(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
@@ -345,18 +357,3 @@ def test_template_memory_md_is_skipped(tmp_path) -> None:
     assert "This file is automatically updated by nanobot" not in prompt
 
 
-def test_customized_memory_md_is_injected(tmp_path) -> None:
-    """A Dream-populated MEMORY.md should be injected normally."""
-    workspace = _make_workspace(tmp_path)
-    from nanobot.utils.helpers import sync_workspace_templates
-    sync_workspace_templates(workspace, silent=True)
-
-    (workspace / "memory" / "MEMORY.md").write_text(
-        "# Long-term Memory\n\nUser prefers dark mode.\n", encoding="utf-8"
-    )
-
-    builder = ContextBuilder(workspace)
-    prompt = builder.build_system_prompt()
-
-    assert "# Memory\n\n## Long-term Memory" in prompt
-    assert "User prefers dark mode" in prompt

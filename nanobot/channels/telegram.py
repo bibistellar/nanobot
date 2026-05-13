@@ -1119,11 +1119,24 @@ class TelegramChannel(BaseChannel):
         sender_id = self._sender_id(user)
         if not self.is_allowed(sender_id):
             return
+
+        # In groups, only handle commands explicitly targeted at this bot
+        # (e.g. /model@nanostellar_bot). /model@anotherbot must be ignored
+        # so we don't hijack commands intended for other bots in the room.
+        content = message.text or ""
+        cmd_part = content.split(" ", 1)[0]
+        if "@" in cmd_part:
+            target = cmd_part.split("@", 1)[1].lower()
+            _, bot_username = await self._ensure_bot_identity()
+            if bot_username and target != bot_username.lower():
+                return
+        elif message.chat.type != "private":
+            return
+
         self._remember_thread_context(message)
         self.clear_turn_message(str(message.chat_id))
 
         # Strip @bot_username suffix if present
-        content = message.text or ""
         if content.startswith("/") and "@" in content:
             cmd_part, *rest = content.split(" ", 1)
             cmd_part = cmd_part.split("@")[0]

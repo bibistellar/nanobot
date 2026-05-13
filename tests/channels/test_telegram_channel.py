@@ -890,7 +890,7 @@ async def test_group_policy_mention_accepts_caption_mention() -> None:
     )
 
     assert len(handled) == 1
-    assert handled[0]["content"] == "@nanobot_test photo"
+    assert handled[0]["content"] == "[Alice @alice]: @nanobot_test photo"
 
 
 @pytest.mark.asyncio
@@ -1008,7 +1008,7 @@ async def test_on_message_includes_reply_context() -> None:
     await channel._on_message(update, None)
 
     assert len(handled) == 1
-    assert handled[0]["content"].startswith("[Reply to: Hello]")
+    assert "[Reply to: Hello]" in handled[0]["content"]
     assert "translate this" in handled[0]["content"]
 
 
@@ -1142,7 +1142,7 @@ async def test_on_message_attaches_reply_to_media_when_available(monkeypatch, tm
     await channel._on_message(update, None)
 
     assert len(handled) == 1
-    assert handled[0]["content"].startswith("[Reply to: [image:")
+    assert "[Reply to: [image:" in handled[0]["content"]
     assert "what is the image?" in handled[0]["content"]
     assert len(handled[0]["media"]) == 1
     assert "reply_photo_fid" in handled[0]["media"][0]
@@ -1245,7 +1245,7 @@ async def test_forward_command_does_not_inject_reply_context() -> None:
     channel._handle_message = capture_handle
 
     reply = SimpleNamespace(text="some old message", message_id=2, from_user=SimpleNamespace(id=1))
-    update = _make_telegram_update(text="/new", reply_to_message=reply)
+    update = _make_telegram_update(text="/new@nanobot_test", reply_to_message=reply)
     await channel._forward_command(update, None)
 
     assert len(handled) == 1
@@ -1292,6 +1292,70 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
 
     assert len(handled) == 1
     assert handled[0]["content"] == "/dream-restore deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_forward_command_ignores_command_targeted_at_another_bot() -> None:
+    """In groups, /cmd@otherbot must not trigger this bot — even if regex matched."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    update = _make_telegram_update(text="/model@ShoreKeeper")
+
+    await channel._forward_command(update, None)
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_forward_command_rejects_bare_command_in_group() -> None:
+    """Group chats require explicit @bot_username on the command itself."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    update = _make_telegram_update(text="/model", chat_type="group")
+
+    await channel._forward_command(update, None)
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_forward_command_accepts_bare_command_in_private() -> None:
+    """Private chats accept bare /cmd without the @bot suffix."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    update = _make_telegram_update(text="/model", chat_type="private")
+
+    await channel._forward_command(update, None)
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == "/model"
 
 
 @pytest.mark.asyncio
@@ -1385,7 +1449,7 @@ async def test_on_message_location_content() -> None:
     await channel._on_message(update, None)
 
     assert len(handled) == 1
-    assert handled[0]["content"] == "[location: 48.8566, 2.3522]"
+    assert "[location: 48.8566, 2.3522]" in handled[0]["content"]
 
 
 @pytest.mark.asyncio

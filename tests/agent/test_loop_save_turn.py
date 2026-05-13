@@ -883,3 +883,131 @@ async def test_subagent_followup_uses_thread_session_and_slack_metadata(tmp_path
     loop.sessions.invalidate("slack:C123:1700.42")
     persisted = loop.sessions.get_or_create("slack:C123:1700.42")
     assert any(m.get("task_id") == "sub-1" for m in persisted.messages)
+
+
+@pytest.mark.asyncio
+async def test_cron_result_runs_decision_turn_in_deliver_session(tmp_path: Path) -> None:
+    """cron_result messages should trigger _handle_cron_result, which runs a
+    one-off agent turn in the deliver-target session with a decision prompt
+    that includes the original task and the subagent output.
+    """
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    seen: dict[str, object] = {}
+
+    async def fake_run_agent_loop(initial_messages, **kwargs):
+        seen["initial_messages"] = initial_messages
+        seen["session_key"] = kwargs.get("session_key")
+        seen["channel"] = kwargs.get("channel")
+        seen["chat_id"] = kwargs.get("chat_id")
+        # Simulate LLM saying nothing (silent — routine result, no anomaly).
+        return ("", [], [*initial_messages], "stop", False)
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+    outbound = await loop._process_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id="subagent",
+            chat_id="user-42",
+            content="Server load 0.3, memory 65%, all services responding.",
+            session_key_override="telegram:user-42",
+            metadata={
+                "type": "cron_result",
+                "task_id": "sub-9",
+                "status": "completed",
+                "cron_job_id": "job-1",
+                "cron_job_name": "health-check",
+                "cron_task_message": "check prod, alert only on anomaly",
+                "cron_deliver": True,
+                "cron_deliver_channel": "telegram",
+                "cron_deliver_chat_id": "user-42",
+                "cron_deliver_meta": {},
+            },
+        )
+    )
+
+    # Empty LLM output + no message-tool call → silent (no outbound).
+    assert outbound is None
+    # Decision turn ran in the deliver-target session.
+    assert seen["session_key"] == "telegram:user-42"
+    assert seen["channel"] == "telegram"
+    assert seen["chat_id"] == "user-42"
+    # The prompt to the LLM must include the original task and the subagent
+    # output so the LLM has full context to decide.
+    user_msg = seen["initial_messages"][-1]["content"]
+    assert "check prod, alert only on anomaly" in user_msg
+    assert "Server load 0.3" in user_msg
+    assert "Decide whether this result warrants notifying the user" in user_msg
+
+
+@pytest.mark.asyncio
+async def test_cron_result_falls_back_to_outbound_when_llm_returns_text(tmp_path: Path) -> None:
+    """If the LLM ignores the message tool but produces text, deliver it as a
+    plain OutboundMessage so the result is not lost."""
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    async def fake_run_agent_loop(initial_messages, **_kwargs):
+        return (
+            "CPU is at 95% — investigate.",
+            [],
+            [*initial_messages, {"role": "assistant", "content": "..."}],
+            "stop",
+            False,
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+    outbound = await loop._process_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id="subagent",
+            chat_id="user-42",
+            content="CPU 95%",
+            session_key_override="telegram:user-42",
+            metadata={
+                "type": "cron_result",
+                "cron_job_id": "j",
+                "cron_task_message": "monitor cpu",
+                "cron_deliver": True,
+                "cron_deliver_channel": "telegram",
+                "cron_deliver_chat_id": "user-42",
+            },
+        )
+    )
+
+    assert outbound is not None
+    assert outbound.channel == "telegram"
+    assert outbound.chat_id == "user-42"
+    assert outbound.content == "CPU is at 95% — investigate."
+
+
+@pytest.mark.asyncio
+async def test_cron_result_skips_delivery_when_cron_deliver_false(tmp_path: Path) -> None:
+    """cron_deliver=False jobs must never produce an outbound, no matter what."""
+    loop = _make_full_loop(tmp_path)
+
+    async def _should_not_run(*_args, **_kwargs):  # pragma: no cover - guard
+        raise AssertionError("agent loop must not run when cron_deliver=False")
+
+    loop._run_agent_loop = _should_not_run  # type: ignore[method-assign]
+
+    outbound = await loop._process_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id="subagent",
+            chat_id="user-42",
+            content="anything",
+            metadata={
+                "type": "cron_result",
+                "cron_job_id": "j",
+                "cron_task_message": "silent job",
+                "cron_deliver": False,
+                "cron_deliver_channel": "telegram",
+                "cron_deliver_chat_id": "user-42",
+            },
+        )
+    )
+    assert outbound is None

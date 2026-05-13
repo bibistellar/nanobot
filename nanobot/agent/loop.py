@@ -1215,6 +1215,13 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         self._refresh_provider_snapshot()
+        # Cron-task results carry ``metadata["type"] == "cron_result"``; they
+        # go through a dedicated, ephemeral path that lets the main agent
+        # decide whether to notify the user, without persisting noise into
+        # the user's chat history.
+        if isinstance(msg.metadata, dict) and msg.metadata.get("type") == "cron_result":
+            return await self._handle_cron_result(msg, pending_queue=pending_queue)
+
         # Sub-agent results carry ``metadata["type"] == "subagent_result"``;
         # they fan out to a dedicated path that persists the structured result
         # and lets the LLM produce a user-facing summary.
@@ -1700,6 +1707,114 @@ class AgentLoop:
             content=content,
             buttons=buttons,
             metadata=outbound_metadata,
+        )
+
+    async def _handle_cron_result(
+        self,
+        msg: InboundMessage,
+        *,
+        pending_queue: asyncio.Queue | None,
+    ) -> OutboundMessage | None:
+        """Process a cron-task subagent result.
+
+        Runs a one-off agent turn in the deliver-target session.  The LLM
+        sees the original task, the subagent's output, and an instruction
+        to decide whether the result merits notifying the user.  If yes,
+        the LLM calls the ``message`` tool which routes through standard
+        channel delivery.  If no (e.g. routine check, no anomaly), the LLM
+        responds with empty content and we drop the turn silently.
+
+        The decision turn itself is *not* persisted into the deliver session's
+        history — cron noise should not clutter the user's chat record.  The
+        delivered message (if any) is persisted by the standard message-tool
+        delivery path.
+        """
+        md = msg.metadata or {}
+        job_id = md.get("cron_job_id")
+        job_name = md.get("cron_job_name")
+        task_message = md.get("cron_task_message", "")
+        deliver_enabled = bool(md.get("cron_deliver", True))
+        deliver_channel = md.get("cron_deliver_channel") or msg.channel
+        deliver_chat_id = md.get("cron_deliver_chat_id") or msg.chat_id
+        deliver_meta = dict(md.get("cron_deliver_meta") or {})
+        subagent_status = md.get("status", "completed")
+        subagent_result = msg.content or ""
+
+        logger.info(
+            "Cron result: job={} ({}) status={} deliver={} target={}:{}",
+            job_id, job_name, subagent_status, deliver_enabled,
+            deliver_channel, deliver_chat_id,
+        )
+
+        if not deliver_enabled:
+            # Job was scheduled with deliver=False — never notify the user.
+            return None
+        if not deliver_channel or not deliver_chat_id:
+            logger.warning("Cron result job={} has no deliver target; dropping", job_id)
+            return None
+
+        decision_prompt = (
+            "[Cron Task Result]\n"
+            f"Original task: {task_message}\n"
+            f"Subagent status: {subagent_status}\n"
+            f"Delivery target: {deliver_channel}:{deliver_chat_id}\n\n"
+            "--- Subagent output (begin) ---\n"
+            f"{subagent_result}\n"
+            "--- Subagent output (end) ---\n\n"
+            "Decide whether this result warrants notifying the user. "
+            "If yes, call the `message` tool with target_channel='" + deliver_channel + "' "
+            "and chat_id='" + deliver_chat_id + "' carrying a brief, natural message "
+            "in the user's language. Speak directly to them; do not include task "
+            "ids, status reports, or self-references. "
+            "If the result is routine and not worth interrupting the user "
+            "(e.g. a periodic check with no anomaly), respond with empty content "
+            "and do not call any tools."
+        )
+
+        key = f"{deliver_channel}:{deliver_chat_id}"
+        session = self.sessions.get_or_create(key)
+
+        self._set_tool_context(
+            deliver_channel, deliver_chat_id, None, deliver_meta, session_key=key,
+        )
+        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool):
+            mt.start_turn()
+
+        messages = self.context.build_messages(
+            history=[],
+            current_message=decision_prompt,
+            channel=deliver_channel,
+            chat_id=deliver_chat_id,
+            sender_id="cron",
+            model=self.model,
+        )
+
+        final_content, _, _, _, _ = await self._run_agent_loop(
+            messages,
+            session=session,
+            channel=deliver_channel,
+            chat_id=deliver_chat_id,
+            message_id=None,
+            metadata=deliver_meta,
+            session_key=key,
+            pending_queue=pending_queue,
+        )
+
+        # If the LLM used the message tool, delivery already happened via the
+        # tool's send callback. Suppress any additional outbound to avoid a
+        # second send.
+        if isinstance(mt, MessageTool) and mt._sent_in_turn:
+            return None
+        if not final_content or not final_content.strip():
+            return None
+
+        # Fallback: the LLM didn't use the message tool but produced text.
+        # Deliver it as a plain channel message.
+        return OutboundMessage(
+            channel=deliver_channel,
+            chat_id=deliver_chat_id,
+            content=final_content,
+            metadata=deliver_meta,
         )
 
     def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:

@@ -240,3 +240,59 @@ async def test_cron_tool_no_context_returns_error(tmp_path) -> None:
 
     result = await tool.execute(action="add", message="test", every_seconds=60)
     assert result == "Error: no session context (channel/chat_id)"
+
+
+@pytest.mark.asyncio
+async def test_cron_tool_deliver_to_routes_to_explicit_target(tmp_path) -> None:
+    """deliver_to='channel:chat_id' should set deliver_* without touching origin_*."""
+    tool = CronTool(CronService(tmp_path / "jobs.json"))
+    tool.set_context(RequestContext(channel="slack", chat_id="C_general"))
+
+    result = await tool.execute(
+        action="add",
+        message="check the build status",
+        every_seconds=600,
+        deliver_to="telegram:user_12345",
+    )
+    assert result.startswith("Created job")
+
+    jobs = tool._cron.list_jobs()
+    assert len(jobs) == 1
+    # Origin stays at the place the user created the task.
+    assert jobs[0].payload.origin_channel == "slack"
+    assert jobs[0].payload.origin_chat_id == "C_general"
+    # Delivery is routed to the explicitly requested target.
+    assert jobs[0].payload.deliver_channel == "telegram"
+    assert jobs[0].payload.deliver_chat_id == "user_12345"
+
+
+@pytest.mark.asyncio
+async def test_cron_tool_deliver_to_here_uses_current_session(tmp_path) -> None:
+    """deliver_to='here' (or omitted) should leave delivery == origin."""
+    tool = CronTool(CronService(tmp_path / "jobs.json"))
+    tool.set_context(RequestContext(channel="slack", chat_id="C_general"))
+
+    await tool.execute(
+        action="add",
+        message="x",
+        every_seconds=60,
+        deliver_to="here",
+    )
+    jobs = tool._cron.list_jobs()
+    assert jobs[0].payload.deliver_channel == "slack"
+    assert jobs[0].payload.deliver_chat_id == "C_general"
+
+
+def test_parse_deliver_to() -> None:
+    """deliver_to spec parsing handles 'here', empty, malformed, and well-formed."""
+    assert CronTool._parse_deliver_to(None) == (None, None)
+    assert CronTool._parse_deliver_to("") == (None, None)
+    assert CronTool._parse_deliver_to("here") == (None, None)
+    assert CronTool._parse_deliver_to("HERE") == (None, None)
+    assert CronTool._parse_deliver_to("telegram:12345") == ("telegram", "12345")
+    # Slack thread spec — chat_id keeps the remaining colons.
+    assert CronTool._parse_deliver_to("slack:C123:1700.42") == ("slack", "C123:1700.42")
+    # Malformed specs gracefully fall back to None,None (caller uses defaults).
+    assert CronTool._parse_deliver_to("nochannel") == (None, None)
+    assert CronTool._parse_deliver_to(":empty") == (None, None)
+    assert CronTool._parse_deliver_to("empty:") == (None, None)

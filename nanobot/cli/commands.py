@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import time
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -646,7 +647,6 @@ def _run_gateway(
     open_browser_url: str | None = None,
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
-    from nanobot.agent.tools.cron import CronTool
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
@@ -743,7 +743,18 @@ def _run_gateway(
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
+        """Execute a cron job by spawning a subagent.
+
+        The scheduler invokes this for every due job.  System-event jobs
+        dispatch to the system_events registry; agent_turn jobs spawn a
+        subagent that executes the task in an isolated session.  When the
+        subagent finishes, it publishes an InboundMessage tagged with
+        ``type="cron_result"`` that the main agent's ``_handle_cron_result``
+        path uses to decide whether to notify the user.
+
+        Returns immediately after dispatch — the subagent runs asynchronously
+        so the scheduler is never blocked by a slow LLM call.
+        """
         # System-event jobs (kind="system_event") bypass the agent loop and
         # dispatch to a registered handler keyed by job.name.
         if job.payload.kind == "system_event":
@@ -758,70 +769,42 @@ def _run_gateway(
                 logger.exception("System event '{}' failed", job.name)
             return None
 
-        from nanobot.utils.evaluator import evaluate_response
+        # agent_turn: spawn a subagent to execute the task. The subagent runs
+        # in an isolated session (no shared history with user chats) and gets
+        # a fresh tool registry minus the cron tool (recursion guard).
+        run_id = str(int(time.time() * 1000))
+        cron_session_key = f"cron-task:{job.id}:{run_id}"
 
-        reminder_note = (
-            "The scheduled time has arrived. Deliver this reminder to the user now, "
-            "as a brief and natural message in their language. Speak directly to them — "
-            "do not narrate progress, summarize, include user IDs, or add status reports "
-            "like 'Done' or 'Reminded'.\n\n"
-            f"Reminder: {job.payload.message}"
+        deliver_channel = job.payload.effective_deliver_channel or "cli"
+        deliver_chat_id = job.payload.effective_deliver_chat_id or "direct"
+
+        # Pack cron metadata so _handle_cron_result can read it when the
+        # subagent's result lands in the deliver session.
+        result_metadata = {
+            "type": "cron_result",
+            "cron_job_id": job.id,
+            "cron_job_name": job.name,
+            "cron_task_message": job.payload.message,
+            "cron_deliver": job.payload.deliver,
+            "cron_deliver_channel": deliver_channel,
+            "cron_deliver_chat_id": deliver_chat_id,
+            "cron_deliver_meta": dict(job.payload.deliver_meta or {}),
+        }
+
+        await agent.subagents.spawn(
+            task=job.payload.message,
+            label=f"cron:{job.name}",
+            origin_channel=deliver_channel,
+            origin_chat_id=deliver_chat_id,
+            session_key=cron_session_key,
+            disabled_tools={"cron"},
+            result_metadata=result_metadata,
         )
-
-        cron_tool = agent.tools.get("cron")
-        cron_token = None
-        if isinstance(cron_tool, CronTool):
-            cron_token = cron_tool.set_cron_context(True)
-
-        async def _silent(*_args, **_kwargs):
-            pass
-
-        message_record_token = None
-        if isinstance(message_tool, MessageTool):
-            message_record_token = message_tool.set_record_channel_delivery(True)
-
-        # Clear cron session before each run so the LLM starts with a
-        # clean context and cannot "reuse" stale results from previous runs.
-        cron_session_key = f"cron:{job.id}"
-        cron_session = agent.sessions.get_or_create(cron_session_key)
-        cron_session.clear()
-        agent.sessions.save(cron_session)
-
-        try:
-            resp = await agent.process_direct(
-                reminder_note,
-                session_key=cron_session_key,
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-                on_progress=_silent,
-            )
-        finally:
-            if isinstance(cron_tool, CronTool) and cron_token is not None:
-                cron_tool.reset_cron_context(cron_token)
-            if isinstance(message_tool, MessageTool) and message_record_token is not None:
-                message_tool.reset_record_channel_delivery(message_record_token)
-
-        response = resp.content if resp else ""
-
-        if job.payload.deliver and isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            return response
-
-        if job.payload.deliver and job.payload.to and response:
-            should_notify = await evaluate_response(
-                response, reminder_note, agent.provider, agent.model,
-            )
-            if should_notify:
-                await _deliver_to_channel(
-                    OutboundMessage(
-                        channel=job.payload.channel or "cli",
-                        chat_id=job.payload.to,
-                        content=response,
-                        metadata=dict(job.payload.channel_meta),
-                    ),
-                    record=True,
-                    session_key=job.payload.session_key,
-                )
-        return response
+        logger.info(
+            "Cron: spawned subagent for job '{}' ({}); deliver -> {}:{}",
+            job.name, job.id, deliver_channel, deliver_chat_id,
+        )
+        return None
 
     cron.on_job = on_cron_job
 

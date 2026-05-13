@@ -132,8 +132,19 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         origin_message_id: str | None = None,
+        disabled_tools: set[str] | None = None,
+        result_metadata: dict[str, Any] | None = None,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        ``disabled_tools`` removes the named tools from the subagent's
+        registry after default loading — used e.g. by cron to prevent the
+        scheduled job from creating new cron jobs (recursion).
+
+        ``result_metadata`` is merged into the announcement InboundMessage's
+        metadata so callers can carry job/job-like context through to the
+        main agent that handles the result.
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
@@ -147,7 +158,11 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id)
+            self._run_subagent(
+                task_id, task, display_label, origin, status, origin_message_id,
+                disabled_tools=disabled_tools,
+                result_metadata=result_metadata,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -174,6 +189,8 @@ class SubagentManager:
         origin: dict[str, str],
         status: SubagentStatus,
         origin_message_id: str | None = None,
+        disabled_tools: set[str] | None = None,
+        result_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -184,6 +201,8 @@ class SubagentManager:
 
         try:
             tools = self._build_tools()
+            for tool_name in disabled_tools or ():
+                tools.unregister(tool_name)
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -216,6 +235,7 @@ class SubagentManager:
                     origin=origin, status="failed",
                     duration_ms=duration_ms, token_usage=token_usage,
                     origin_message_id=origin_message_id,
+                    extra_metadata=result_metadata,
                 )
             elif result.stop_reason == "error":
                 await self._announce_result(
@@ -224,6 +244,7 @@ class SubagentManager:
                     origin=origin, status="failed",
                     duration_ms=duration_ms, token_usage=token_usage,
                     origin_message_id=origin_message_id,
+                    extra_metadata=result_metadata,
                 )
             else:
                 final_result = result.final_content or "Task completed but no final response was generated."
@@ -233,6 +254,7 @@ class SubagentManager:
                     result=final_result, origin=origin, status="completed",
                     duration_ms=duration_ms, token_usage=token_usage,
                     origin_message_id=origin_message_id,
+                    extra_metadata=result_metadata,
                 )
 
         except Exception as e:
@@ -245,6 +267,7 @@ class SubagentManager:
                 result=f"Error: {e}", origin=origin, status="failed",
                 duration_ms=duration_ms, token_usage=None,
                 origin_message_id=origin_message_id,
+                extra_metadata=result_metadata,
             )
 
     async def _announce_result(
@@ -259,6 +282,7 @@ class SubagentManager:
         duration_ms: int,
         token_usage: dict[str, int] | None,
         origin_message_id: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Publish the subagent result back to the main agent's bus.
 
@@ -275,22 +299,25 @@ class SubagentManager:
         we don't store pre-rendered text on disk.
         """
         override = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
+        metadata: dict[str, Any] = {
+            "type": "subagent_result",
+            "task_id": task_id,
+            "label": label,
+            "status": status,
+            "duration_ms": duration_ms,
+            "result_task": task,
+            "token_usage": token_usage,
+            "origin_message_id": origin_message_id,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
         msg = InboundMessage(
             channel=origin["channel"],
             sender_id="subagent",
             chat_id=origin["chat_id"],
             content=result,
             session_key_override=override,
-            metadata={
-                "type": "subagent_result",
-                "task_id": task_id,
-                "label": label,
-                "status": status,
-                "duration_ms": duration_ms,
-                "result_task": task,
-                "token_usage": token_usage,
-                "origin_message_id": origin_message_id,
-            },
+            metadata=metadata,
         )
 
         await self.bus.publish_inbound(msg)

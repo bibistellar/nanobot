@@ -42,6 +42,13 @@ _CRON_PARAMETERS = tool_parameters_schema(
         description="Whether to deliver the execution result to the user channel (default true)",
         default=True,
     ),
+    deliver_to=StringSchema(
+        "Where to deliver the result.  Format: '<channel>:<chat_id>' "
+        "(e.g. 'telegram:12345', 'slack:C123:thread_ts'), or 'here' to use the "
+        "current chat.  Default: 'here'.  Use this when the user creates a "
+        "task in one chat but wants the result delivered elsewhere "
+        "(e.g. asks in a group but wants results in DM).",
+    ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     required=["action"],
     description=(
@@ -142,17 +149,36 @@ class CronTool(Tool, ContextAware):
         at: str | None = None,
         job_id: str | None = None,
         deliver: bool = True,
+        deliver_to: str | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver)
+            return self._add_job(
+                name, message, every_seconds, cron_expr, tz, at, deliver, deliver_to,
+            )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
+
+    @staticmethod
+    def _parse_deliver_to(spec: str | None) -> tuple[str | None, str | None]:
+        """Parse a 'channel:chat_id' deliver_to spec.
+
+        Returns (channel, chat_id) — both ``None`` for 'here' or an empty spec
+        (caller should fall back to current session).  Channel:chat_id may
+        contain additional colon-separated parts (e.g. Slack thread_ts), all
+        joined back into the chat_id.
+        """
+        if not spec or spec.strip().lower() == "here":
+            return None, None
+        parts = spec.split(":", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None, None
+        return parts[0], parts[1]
 
     def _add_job(
         self,
@@ -163,6 +189,7 @@ class CronTool(Tool, ContextAware):
         tz: str | None,
         at: str | None,
         deliver: bool = True,
+        deliver_to: str | None = None,
     ) -> str:
         if not message:
             return (
@@ -206,16 +233,19 @@ class CronTool(Tool, ContextAware):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
+        deliver_channel_override, deliver_chat_override = self._parse_deliver_to(deliver_to)
         job = self._cron.add_job(
             name=name or message[:30],
             schedule=schedule,
             message=message,
             deliver=deliver,
-            channel=channel,
-            to=chat_id,
+            origin_channel=channel,
+            origin_chat_id=chat_id,
+            origin_session_key=self._session_key.get() or None,
+            deliver_channel=deliver_channel_override or channel,
+            deliver_chat_id=deliver_chat_override or chat_id,
+            deliver_meta={} if deliver_channel_override else self._metadata.get(),
             delete_after_run=delete_after,
-            channel_meta=self._metadata.get(),
-            session_key=self._session_key.get() or None,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 

@@ -1084,19 +1084,23 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
 
 
-def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
+def test_gateway_cron_job_spawns_subagent_with_task_metadata(
     monkeypatch, tmp_path: Path
 ) -> None:
+    """Cron firing must spawn a subagent with the raw task message (no
+    'reminder' wrapper) and pack the deliver target into result_metadata
+    so the main agent can route the result correctly when it lands."""
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
     config_file.write_text("{}")
 
     config = Config()
     config.agents.defaults.workspace = str(tmp_path / "config-workspace")
-    provider = _fake_provider()
     bus = MagicMock()
     bus.publish_outbound = AsyncMock()
     seen: dict[str, object] = {}
+
+    provider = _fake_provider()
 
     monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
@@ -1111,161 +1115,6 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
         lambda _config_path=None: _test_provider_snapshot(provider, config),
     )
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.messages = []
-
-        def add_message(self, role: str, content: str, **kwargs) -> None:
-            self.messages.append({"role": role, "content": content, **kwargs})
-
-    class _FakeSessionManager:
-        def __init__(self, _workspace: Path) -> None:
-            self.session = _FakeSession()
-            seen["session_manager"] = self
-
-        def get_or_create(self, key: str) -> _FakeSession:
-            seen["session_key"] = key
-            return self.session
-
-        def save(self, session: _FakeSession) -> None:
-            seen["saved_session"] = session
-
-    monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
-
-    class _FakeCron:
-        def __init__(self, _store_path: Path) -> None:
-            self.on_job = None
-            seen["cron"] = self
-
-    class _FakeAgentLoop:
-        @classmethod
-        def from_config(cls, config, bus=None, **extra):
-            return cls(**extra)
-        def __init__(self, *args, **kwargs) -> None:
-            self.model = "test-model"
-            self.provider = kwargs.get("provider", object())
-            self.tools = {}
-
-        async def process_direct(self, *_args, **_kwargs):
-            return OutboundMessage(
-                channel="telegram",
-                chat_id="user-1",
-                content="Time to stretch.",
-            )
-
-        async def close_mcp(self) -> None:
-            return None
-
-        async def run(self) -> None:
-            return None
-
-        def stop(self) -> None:
-            return None
-
-    class _StopAfterCronSetup:
-        def __init__(self, *_args, **_kwargs) -> None:
-            raise _StopGatewayError("stop")
-
-    async def _capture_evaluate_response(
-        response: str,
-        task_context: str,
-        provider_arg: object,
-        model: str,
-    ) -> bool:
-        seen["response"] = response
-        seen["task_context"] = task_context
-        seen["provider"] = provider_arg
-        seen["model"] = model
-        return True
-
-    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
-    monkeypatch.setattr("nanobot.cli.commands.AgentLoop", _FakeAgentLoop)
-    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
-    monkeypatch.setattr(
-        "nanobot.utils.evaluator.evaluate_response",
-        _capture_evaluate_response,
-    )
-
-    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
-
-    assert isinstance(result.exception, _StopGatewayError)
-    cron = seen["cron"]
-    assert isinstance(cron, _FakeCron)
-    assert cron.on_job is not None
-
-    job = CronJob(
-        id="cron-1",
-        name="stretch",
-        payload=CronPayload.from_dict({
-            "message": "Remind me to stretch.",
-            "deliver": True,
-            "channel": "telegram",
-            "to": "user-1",
-        }),
-    )
-
-    response = asyncio.run(cron.on_job(job))
-
-    assert response == "Time to stretch."
-    assert seen["response"] == "Time to stretch."
-    assert seen["provider"] is provider
-    assert seen["model"] == "test-model"
-    assert seen["task_context"] == (
-        "The scheduled time has arrived. Deliver this reminder to the user now, "
-        "as a brief and natural message in their language. Speak directly to them — "
-        "do not narrate progress, summarize, include user IDs, or add status reports "
-        "like 'Done' or 'Reminded'.\n\n"
-        "Reminder: Remind me to stretch."
-    )
-    bus.publish_outbound.assert_awaited_once_with(
-        OutboundMessage(
-            channel="telegram",
-            chat_id="user-1",
-            content="Time to stretch.",
-        )
-    )
-    assert seen["session_key"] == "telegram:user-1"
-    saved_session = seen["saved_session"]
-    assert isinstance(saved_session, _FakeSession)
-    assert saved_session.messages == [
-        {
-            "role": "assistant",
-            "content": "Time to stretch.",
-            "_channel_delivery": True,
-        }
-    ]
-
-
-def test_gateway_cron_job_suppresses_intermediate_progress(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Cron jobs must pass on_progress=_silent to process_direct so that
-    tool hints and streaming deltas are never leaked to the user channel
-    before evaluate_response decides whether to deliver."""
-    config_file = tmp_path / "instance" / "config.json"
-    config_file.parent.mkdir(parents=True)
-    config_file.write_text("{}")
-
-    config = Config()
-    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
-    bus = MagicMock()
-    bus.publish_outbound = AsyncMock()
-    seen: dict[str, object] = {}
-
-    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
-    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr("nanobot.providers.factory.make_provider", lambda _config: _fake_provider())
-    monkeypatch.setattr(
-        "nanobot.providers.factory.build_provider_snapshot",
-        lambda _config: _test_provider_snapshot(object(), _config),
-    )
-    monkeypatch.setattr(
-        "nanobot.providers.factory.load_provider_snapshot",
-        lambda _config_path=None: _test_provider_snapshot(object(), config),
-    )
-    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
     monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace: object())
 
     class _FakeCron:
@@ -1273,22 +1122,30 @@ def test_gateway_cron_job_suppresses_intermediate_progress(
             self.on_job = None
             seen["cron"] = self
 
+        def register_system_job(self, _job) -> None:
+            pass
+
+    class _FakeSubagents:
+        def __init__(self) -> None:
+            self.spawned: list[dict] = []
+
+        async def spawn(self, **kwargs) -> str:
+            self.spawned.append(kwargs)
+            return "task-id-abc"
+
+    fake_subagents = _FakeSubagents()
+
     class _FakeAgentLoop:
         @classmethod
         def from_config(cls, config, bus=None, **extra):
             return cls(**extra)
+
         def __init__(self, *args, **kwargs) -> None:
             self.model = "test-model"
-            self.provider = object()
+            self.provider = kwargs.get("provider", provider)
             self.tools = {}
-
-        async def process_direct(self, *_args, on_progress=None, **_kwargs):
-            seen["on_progress"] = on_progress
-            return OutboundMessage(
-                channel="telegram",
-                chat_id="user-1",
-                content="Done.",
-            )
+            self.subagents = fake_subagents
+            seen["agent"] = self
 
         async def close_mcp(self) -> None:
             return None
@@ -1303,41 +1160,53 @@ def test_gateway_cron_job_suppresses_intermediate_progress(
         def __init__(self, *_args, **_kwargs) -> None:
             raise _StopGatewayError("stop")
 
-    async def _always_reject(*_args, **_kwargs) -> bool:
-        return False
-
     monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
     monkeypatch.setattr("nanobot.cli.commands.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
-    monkeypatch.setattr(
-        "nanobot.utils.evaluator.evaluate_response",
-        _always_reject,
-    )
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
-    assert isinstance(result.exception, _StopGatewayError)
 
+    assert isinstance(result.exception, _StopGatewayError)
     cron = seen["cron"]
+    assert cron.on_job is not None
+
     job = CronJob(
-        id="cron-silent-test",
-        name="test-silent",
+        id="cron-1",
+        name="stretch",
         payload=CronPayload.from_dict({
-            "message": "Run something.",
+            "message": "Check the build status and report.",
             "deliver": True,
             "channel": "telegram",
             "to": "user-1",
         }),
     )
+
     response = asyncio.run(cron.on_job(job))
 
-    assert response == "Done."
-    # on_progress must be a callable (the _silent noop), not None and not bus_progress
-    assert seen["on_progress"] is not None
-    assert callable(seen["on_progress"])
-    # Verify it actually swallows calls (no side effects)
-    asyncio.run(seen["on_progress"]("tool_hint", "🔧 $ echo test"))
-    # Nothing published to bus since evaluator rejected
-    bus.publish_outbound.assert_not_awaited()
+    # Scheduler must not be blocked — on_cron_job returns immediately.
+    assert response is None
+
+    # One subagent spawn, with the raw task (no reminder wrapper).
+    assert len(fake_subagents.spawned) == 1
+    spawn = fake_subagents.spawned[0]
+    assert spawn["task"] == "Check the build status and report."
+    assert spawn["label"] == "cron:stretch"
+    assert spawn["origin_channel"] == "telegram"
+    assert spawn["origin_chat_id"] == "user-1"
+    assert spawn["session_key"].startswith("cron-task:cron-1:")
+    # The cron tool must be disabled in the subagent to prevent recursive
+    # scheduling.
+    assert "cron" in spawn["disabled_tools"]
+    # Result metadata carries the deliver target so _handle_cron_result can
+    # route the eventual notification.
+    meta = spawn["result_metadata"]
+    assert meta["type"] == "cron_result"
+    assert meta["cron_job_id"] == "cron-1"
+    assert meta["cron_task_message"] == "Check the build status and report."
+    assert meta["cron_deliver"] is True
+    assert meta["cron_deliver_channel"] == "telegram"
+    assert meta["cron_deliver_chat_id"] == "user-1"
+
 
 
 def test_gateway_workspace_override_does_not_migrate_legacy_cron(

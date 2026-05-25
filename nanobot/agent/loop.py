@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import json
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
@@ -15,18 +14,15 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent import context as agent_context
+from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+from nanobot.agent.hook import AgentHook, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.ask import (
-    ask_user_options_from_messages,
-    ask_user_outbound,
-    ask_user_tool_result_messages,
-    pending_ask_user_id,
-)
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -34,23 +30,24 @@ from nanobot.agent.tools.self import MyTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults
+from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.session.goal_state import (
+    runner_wall_llm_timeout_s,
+)
 from nanobot.session.manager import Session, SessionManager
-from nanobot.utils.artifacts import generated_image_paths_from_messages
+from nanobot.session.webui_turns import (
+    WebuiTurnCoordinator,
+    build_bus_progress_callback,
+    mark_webui_session,
+)
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
-from nanobot.utils.progress_events import (
-    build_tool_event_finish_payloads,
-    build_tool_event_start_payload,
-    invoke_on_progress,
-    on_progress_accepts_tool_events,
-)
+from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
-from nanobot.utils.webui_titles import mark_webui_session, maybe_generate_webui_title_after_turn
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -62,115 +59,6 @@ if TYPE_CHECKING:
 
 
 UNIFIED_SESSION_KEY = "unified:default"
-
-
-class _LoopHook(AgentHook):
-    """Core hook for the main loop."""
-
-    def __init__(
-        self,
-        agent_loop: AgentLoop,
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-        on_stream: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        *,
-        channel: str = "cli",
-        chat_id: str = "direct",
-        message_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        session_key: str | None = None,
-    ) -> None:
-        super().__init__(reraise=True)
-        self._loop = agent_loop
-        self._on_progress = on_progress
-        self._on_stream = on_stream
-        self._on_stream_end = on_stream_end
-        self._channel = channel
-        self._chat_id = chat_id
-        self._message_id = message_id
-        self._metadata = metadata or {}
-        self._session_key = session_key
-        self._stream_buf = ""
-
-    def wants_streaming(self) -> bool:
-        return self._on_stream is not None
-
-    async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        from nanobot.utils.helpers import strip_think
-
-        prev_clean = strip_think(self._stream_buf)
-        self._stream_buf += delta
-        new_clean = strip_think(self._stream_buf)
-        incremental = new_clean[len(prev_clean) :]
-        if incremental and self._on_stream:
-            await self._on_stream(incremental)
-
-    async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
-        if self._on_stream_end:
-            await self._on_stream_end(resuming=resuming)
-        self._stream_buf = ""
-
-    async def before_iteration(self, context: AgentHookContext) -> None:
-        self._loop._current_iteration = context.iteration
-        logger.debug(
-            "Starting agent loop iteration {} for session {}",
-            context.iteration,
-            self._session_key,
-        )
-
-    async def before_execute_tools(self, context: AgentHookContext) -> None:
-        if self._on_progress:
-            if not self._on_stream and not context.streamed_content:
-                thought = self._loop._strip_think(
-                    context.response.content if context.response else None
-                )
-                if thought:
-                    await self._on_progress(thought)
-            tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
-            tool_events = [build_tool_event_start_payload(tc) for tc in context.tool_calls]
-            await invoke_on_progress(
-                self._on_progress,
-                tool_hint,
-                tool_hint=True,
-                tool_events=tool_events,
-            )
-        for tc in context.tool_calls:
-            args_str = json.dumps(tc.arguments, ensure_ascii=False)
-            logger.info("Tool call: {}({})", tc.name, args_str[:200])
-        self._loop._set_tool_context(
-            self._channel,
-            self._chat_id,
-            self._message_id,
-            self._metadata,
-            session_key=self._session_key,
-        )
-
-    async def after_iteration(self, context: AgentHookContext) -> None:
-        if (
-            self._on_progress
-            and context.tool_calls
-            and context.tool_events
-            and on_progress_accepts_tool_events(self._on_progress)
-        ):
-            tool_events = build_tool_event_finish_payloads(context)
-            if tool_events:
-                await invoke_on_progress(
-                    self._on_progress,
-                    "",
-                    tool_hint=False,
-                    tool_events=tool_events,
-                )
-        u = context.usage or {}
-        logger.debug(
-            "LLM usage: prompt={} completion={} cached={}",
-            u.get("prompt_tokens", 0),
-            u.get("completion_tokens", 0),
-            u.get("cached_tokens", 0),
-        )
-
-    def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
-        return self._loop._strip_think(content)
-
 
 class TurnState(Enum):
     RESTORE = auto()
@@ -213,7 +101,6 @@ class TurnContext:
     save_skip: int = 0
 
     outbound: OutboundMessage | None = None
-    generated_media: list[str] = field(default_factory=list)
 
     on_progress: Callable[..., Awaitable[None]] | None = None
     on_stream: Callable[[str], Awaitable[None]] | None = None
@@ -222,6 +109,9 @@ class TurnContext:
 
     pending_queue: asyncio.Queue | None = None
     pending_summary: str | None = None
+
+    turn_wall_started_at: float = field(default_factory=time.time)
+    turn_latency_ms: int | None = None
 
     trace: list[StateTraceEntry] = field(default_factory=list)
 
@@ -246,6 +136,11 @@ class AgentLoop:
     def tool_names(self) -> list[str]:
         return self.tools.tool_names
 
+    def llm_runtime(self) -> LLMRuntime:
+        """Return the current provider/model pair owned by this loop."""
+        self._refresh_provider_snapshot()
+        return LLMRuntime(self.provider, self.model)
+
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
 
@@ -269,6 +164,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int | None = None,
+        max_concurrent_subagents: int | None = None,
         context_window_tokens: int | None = None,
         context_block_limit: int | None = None,
         max_tool_result_chars: int | None = None,
@@ -289,10 +185,14 @@ class AgentLoop:
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
-        provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
+        provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
         dashscope_client: Any | None = None,
         system_to_user_models: list[str] | None = None,
+        model_presets: dict[str, ModelPresetConfig] | None = None,
+        model_preset: str | None = None,
+        preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
+        runtime_model_publisher: Callable[[str, str | None], None] | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -303,7 +203,10 @@ class AgentLoop:
         self.channels_config = channels_config
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
+        self._preset_snapshot_loader = preset_snapshot_loader
+        self._runtime_model_publisher = runtime_model_publisher
         self._provider_signature = provider_signature
+        self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = (
@@ -338,12 +241,18 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        self._pending_turn_latency_ms: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills,
                                       dashscope_client=dashscope_client,
                                       system_to_user_models=system_to_user_models)
         self.sessions = session_manager or SessionManager(workspace)
+        self._webui_turns = WebuiTurnCoordinator(
+            bus=self.bus,
+            sessions=self.sessions,
+            schedule_background=lambda coro: self._schedule_background(coro),
+        )
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
@@ -359,6 +268,8 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
+            max_concurrent_subagents=max_concurrent_subagents,
+            llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -401,6 +312,10 @@ class AgentLoop:
             model=self.model,
             dashscope_client=dashscope_client,
         )
+        self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
+        self._active_preset: str | None = None
+        if model_preset:
+            self.set_model_preset(model_preset, publish_update=False)
         self._register_default_tools()
         self._runtime_vars: dict[str, Any] = {}
         self._current_iteration: int = 0
@@ -426,14 +341,21 @@ class AgentLoop:
             bus = MessageBus()
         defaults = config.agents.defaults
         provider = extra.pop("provider", None) or make_provider(config)
-        model = extra.pop("model", None) or defaults.model
-        context_window_tokens = extra.pop("context_window_tokens", None) or defaults.context_window_tokens
+        resolved = config.resolve_preset()
+        model = extra.pop("model", None) or resolved.model
+        context_window_tokens = extra.pop("context_window_tokens", None) or resolved.context_window_tokens
+        provider_snapshot_loader = extra.pop("provider_snapshot_loader", None)
+        preset_snapshot_loader = extra.pop("preset_snapshot_loader", None) or preset_helpers.make_preset_snapshot_loader(
+            config,
+            provider_snapshot_loader,
+        )
         return cls(
             bus=bus,
             provider=provider,
             workspace=config.workspace_path,
             model=model,
             max_iterations=defaults.max_tool_iterations,
+            max_concurrent_subagents=defaults.max_concurrent_subagents,
             context_window_tokens=context_window_tokens,
             context_block_limit=defaults.context_block_limit,
             max_tool_result_chars=defaults.max_tool_result_chars,
@@ -449,6 +371,10 @@ class AgentLoop:
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
             tools_config=config.tools,
+            model_presets=preset_helpers.configured_model_presets(config),
+            model_preset=defaults.model_preset,
+            provider_snapshot_loader=provider_snapshot_loader,
+            preset_snapshot_loader=preset_snapshot_loader,
             **extra,
         )
 
@@ -456,13 +382,17 @@ class AgentLoop:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
 
-    def _apply_provider_snapshot(self, snapshot: ProviderSnapshot) -> None:
+    def _apply_provider_snapshot(
+        self,
+        snapshot: ProviderSnapshot,
+        *,
+        publish_update: bool = True,
+        model_preset: str | None = None,
+    ) -> None:
         """Swap model/provider for future turns without disturbing an active one."""
         provider = snapshot.provider
         model = snapshot.model
         context_window_tokens = snapshot.context_window_tokens
-        if self.provider is provider and self.model == model:
-            return
         old_model = self.model
         self.provider = provider
         self.model = model
@@ -472,6 +402,11 @@ class AgentLoop:
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self.dream.set_provider(provider, model)
         self._provider_signature = snapshot.signature
+        if publish_update and self._runtime_model_publisher is not None:
+            self._runtime_model_publisher(
+                self.model,
+                model_preset if model_preset is not None else self.model_preset,
+            )
         logger.info("Runtime model switched for next turn: {} -> {}", old_model, model)
 
     def _refresh_provider_snapshot(self) -> None:
@@ -482,9 +417,44 @@ class AgentLoop:
         except Exception:
             logger.exception("Failed to refresh provider config")
             return
+        default_selection = preset_helpers.default_selection_signature(snapshot.signature)
+        if self._active_preset and self._default_selection_signature in (None, default_selection):
+            self._default_selection_signature = default_selection
+            try:
+                snapshot = self._build_model_preset_snapshot(self._active_preset)
+            except Exception:
+                logger.exception("Failed to refresh active model preset")
+                return
+        else:
+            self._active_preset = None
+            self._default_selection_signature = default_selection
         if snapshot.signature == self._provider_signature:
             return
+        self._default_selection_signature = preset_helpers.default_selection_signature(snapshot.signature)
         self._apply_provider_snapshot(snapshot)
+
+    @property
+    def model_preset(self) -> str | None:
+        return self._active_preset
+
+    @model_preset.setter
+    def model_preset(self, name: str | None) -> None:
+        self.set_model_preset(name)
+
+    def _build_model_preset_snapshot(self, name: str) -> ProviderSnapshot:
+        return preset_helpers.build_runtime_preset_snapshot(
+            name=name,
+            presets=self.model_presets,
+            provider=self.provider,
+            loader=self._preset_snapshot_loader,
+        )
+
+    def set_model_preset(self, name: str | None, *, publish_update: bool = True) -> None:
+        """Resolve a preset by name and apply all runtime model dependents."""
+        name = preset_helpers.normalize_preset_name(name, self.model_presets)
+        snapshot = self._build_model_preset_snapshot(name)
+        self._apply_provider_snapshot(snapshot, publish_update=publish_update, model_preset=name)
+        self._active_preset = name
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools via plugin loader."""
@@ -497,6 +467,7 @@ class AgentLoop:
             bus=self.bus,
             subagent_manager=self.subagents,
             cron_service=self.cron_service,
+            sessions=self.sessions,
             provider_snapshot_loader=self._provider_snapshot_loader,
             image_generation_provider_configs=self._image_generation_provider_configs,
             timezone=self.context.timezone or "UTC",
@@ -514,26 +485,8 @@ class AgentLoop:
         logger.info("Registered {} tools: {}", len(registered), registered)
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
-        if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
-            return
-        self._mcp_connecting = True
-        from nanobot.agent.tools.mcp import connect_mcp_servers
-
-        try:
-            self._mcp_stacks = await connect_mcp_servers(self._mcp_servers, self.tools)
-            if self._mcp_stacks:
-                self._mcp_connected = True
-            else:
-                logger.warning("No MCP servers connected successfully (will retry next message)")
-        except asyncio.CancelledError:
-            logger.warning("MCP connection cancelled (will retry next message)")
-            self._mcp_stacks.clear()
-        except BaseException as e:
-            logger.warning("Failed to connect MCP servers (will retry next message): {}", e)
-            self._mcp_stacks.clear()
-        finally:
-            self._mcp_connecting = False
+        """Connect configured MCP servers."""
+        await agent_context.connect_mcp(self, self.tools)
 
     def _set_tool_context(
         self, channel: str, chat_id: str,
@@ -564,51 +517,15 @@ class AgentLoop:
                 tool.set_context(request_ctx)
 
     @staticmethod
-    def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
-        if not text:
-            return None
-        from nanobot.utils.helpers import strip_think
-
-        return strip_think(text) or None
-
-    @staticmethod
     def _runtime_chat_id(msg: InboundMessage) -> str:
         """Return the chat id shown in runtime metadata for the model."""
         return str(msg.metadata.get("context_chat_id") or msg.chat_id)
-
-    def _tool_hint(self, tool_calls: list) -> str:
-        """Format tool calls as concise hints with smart abbreviation."""
-        from nanobot.utils.tool_hints import format_tool_hints
-
-        return format_tool_hints(tool_calls, max_length=self.tool_hint_max_length)
 
     async def _build_bus_progress_callback(
         self, msg: InboundMessage
     ) -> Callable[..., Awaitable[None]]:
         """Build a progress callback that publishes to the message bus."""
-
-        async def _bus_progress(
-            content: str,
-            *,
-            tool_hint: bool = False,
-            tool_events: list[dict[str, Any]] | None = None,
-        ) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            if tool_events:
-                meta["_tool_events"] = tool_events
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=meta,
-                )
-            )
-
-        return _bus_progress
+        return build_bus_progress_callback(self.bus, msg)
 
     async def _build_retry_wait_callback(
         self, msg: InboundMessage
@@ -633,7 +550,7 @@ class AgentLoop:
         self,
         msg: InboundMessage,
         session: Session,
-        pending_ask_id: str | None,
+        **kwargs: Any,
     ) -> bool:
         """Persist the triggering user message before the turn starts.
 
@@ -641,8 +558,9 @@ class AgentLoop:
         """
         media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
         has_text = isinstance(msg.content, str) and msg.content.strip()
-        if not pending_ask_id and (has_text or media_paths):
-            extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
+        if has_text or media_paths:
+            extra: dict[str, Any] = ({"media": list(media_paths)} if media_paths else {}) | agent_context.session_extra(msg.metadata)
+            extra.update(kwargs)
             text = msg.content if isinstance(msg.content, str) else ""
             session.add_message("user", text, **extra)
             self._mark_pending_user_turn(session)
@@ -655,23 +573,11 @@ class AgentLoop:
         msg: InboundMessage,
         session: Session,
         history: list[dict[str, Any]],
-        pending_ask_id: str | None,
         pending_summary: str | None,
         *,
         session_key: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
-        if pending_ask_id:
-            system_prompt = self.context.build_system_prompt(
-                channel=msg.channel,
-                session_summary=pending_summary,
-            )
-            return ask_user_tool_result_messages(
-                system_prompt,
-                history,
-                pending_ask_id,
-                image_generation_prompt(msg.content, msg.metadata),
-            )
         task_summary = (
             self.subagents.get_task_summary(session_key)
             if (self.subagents and session_key)
@@ -687,6 +593,8 @@ class AgentLoop:
             session_summary=pending_summary,
             model=self.model,
             task_summary=task_summary or None,
+            session_metadata=session.metadata,
+            current_runtime_lines=agent_context.runtime_lines(self, msg, self.context.workspace),
         )
 
     async def _dispatch_command_inline(
@@ -762,8 +670,7 @@ class AgentLoop:
         """
         self._sync_subagent_runtime_limits()
 
-        loop_hook = _LoopHook(
-            self,
+        loop_hook = AgentProgressHook(
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
@@ -772,6 +679,9 @@ class AgentLoop:
             message_id=message_id,
             metadata=metadata,
             session_key=session_key,
+            tool_hint_max_length=self.tool_hint_max_length,
+            set_tool_context=self._set_tool_context,
+            on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
         )
         hook: AgentHook = (
             CompositeHook([loop_hook] + self._extra_hooks) if self._extra_hooks else loop_hook
@@ -822,16 +732,7 @@ class AgentLoop:
                     content, media = extract_documents(content, media)
                     media = media or None
                 user_content = self.context._build_user_content(content, media)
-                runtime_ctx = self.context._build_runtime_context(
-                    pending_msg.channel,
-                    self._runtime_chat_id(pending_msg),
-                    self.context.timezone,
-                )
-                if isinstance(user_content, str):
-                    merged: str | list[dict[str, Any]] = f"{runtime_ctx}\n\n{user_content}"
-                else:
-                    merged = [{"type": "text", "text": runtime_ctx}] + user_content
-                return {"role": "user", "content": merged}
+                return {"role": "user", "content": user_content}
 
             items: list[dict[str, Any]] = []
             while len(items) < limit:
@@ -863,6 +764,13 @@ class AgentLoop:
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
+                # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
+                # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
+                llm_timeout_s=runner_wall_llm_timeout_s(
+                    self.sessions,
+                    session.key if session is not None else session_key,
+                    metadata=(session.metadata if session is not None else None),
+                ),
             ))
         finally:
             reset_file_states(file_state_token)
@@ -903,6 +811,8 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
+            if await agent_context.handle_runtime_control(self, msg, self.tools):
+                continue
             raw = msg.content.strip()
             if self.commands.is_priority(raw):
                 await self._dispatch_command_inline(
@@ -1013,32 +923,12 @@ class AgentLoop:
                             content="", metadata=msg.metadata or {},
                         ))
                     if msg.channel == "websocket":
-                        # Signal that the turn is fully complete (all tools executed,
-                        # final text streamed).  This lets WS clients know when to
-                        # definitively stop the loading indicator.
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata={**msg.metadata, "_turn_end": True},
-                        ))
-                        if msg.metadata.get("webui") is True:
-                            async def _generate_title_and_notify() -> None:
-                                generated = await maybe_generate_webui_title_after_turn(
-                                    channel=msg.channel,
-                                    metadata=msg.metadata,
-                                    sessions=self.sessions,
-                                    session_key=session_key,
-                                    provider=self.provider,
-                                    model=self.model,
-                                )
-                                if generated:
-                                    await self.bus.publish_outbound(OutboundMessage(
-                                        channel=msg.channel,
-                                        chat_id=msg.chat_id,
-                                        content="",
-                                        metadata={**msg.metadata, "_session_updated": True},
-                                    ))
-
-                            self._schedule_background(_generate_title_and_notify())
+                        turn_lat = self._pending_turn_latency_ms.pop(session_key, None)
+                        await self._webui_turns.handle_turn_end(
+                            msg,
+                            session_key=session_key,
+                            latency_ms=turn_lat,
+                        )
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
                     # Preserve partial context from the interrupted turn so
@@ -1090,6 +980,9 @@ class AgentLoop:
                         "Re-published {} leftover message(s) to bus for session {}",
                         leftover, session_key,
                     )
+            await self._webui_turns.publish_run_status(msg, "idle")
+            self._pending_turn_latency_ms.pop(session_key, None)
+            self._webui_turns.discard(session_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -1167,7 +1060,9 @@ class AgentLoop:
             current_role=current_role,
             sender_id=msg.sender_id,
             session_summary=pending,
+            session_metadata=session.metadata, current_runtime_lines=agent_context.runtime_lines(self, msg, self.context.workspace, skip=is_subagent),
         )
+        t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
             messages, session=session, channel=channel, chat_id=chat_id,
             message_id=msg.metadata.get("message_id"),
@@ -1175,7 +1070,11 @@ class AgentLoop:
             session_key=key,
             pending_queue=pending_queue,
         )
-        self._save_turn(session, all_msgs, 1 + len(history))
+        wall_done = time.time()
+        latency_ms = max(0, int((wall_done - t_wall) * 1000))
+        self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
+        if channel == "websocket":
+            self._pending_turn_latency_ms[key] = latency_ms
         session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
@@ -1185,12 +1084,7 @@ class AgentLoop:
                 replay_max_messages=self._max_messages,
             )
         )
-        options = ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else []
-        content, buttons = ask_user_outbound(
-            final_content or "Background task completed.",
-            options,
-            channel,
-        )
+        content = final_content or "Background task completed."
         outbound_metadata: dict[str, Any] = {}
         if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
             outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
@@ -1200,7 +1094,6 @@ class AgentLoop:
             channel=channel,
             chat_id=chat_id,
             content=content,
-            buttons=buttons,
             metadata=outbound_metadata,
         )
 
@@ -1312,8 +1205,9 @@ class AgentLoop:
         all_msgs: list[dict[str, Any]],
         stop_reason: str,
         had_injections: bool,
-        generated_media: list[str],
         on_stream: Callable[[str], Awaitable[None]] | None,
+        *,
+        turn_latency_ms: int | None = None,
     ) -> OutboundMessage | None:
         """Assemble the final outbound message from turn results."""
         # MessageTool suppression
@@ -1325,21 +1219,16 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        content, buttons = ask_user_outbound(
-            final_content,
-            ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else [],
-            msg.channel,
-        )
-        if on_stream is not None and stop_reason not in {"ask_user", "error", "tool_error"}:
+        if on_stream is not None and stop_reason not in {"error", "tool_error"}:
             meta["_streamed"] = True
+        if turn_latency_ms is not None:
+            meta["latency_ms"] = int(turn_latency_ms)
 
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
-            content=content,
-            media=generated_media,
+            content=final_content,
             metadata=meta,
-            buttons=buttons,
         )
 
     async def _state_restore(self, ctx: TurnContext) -> TurnState:
@@ -1380,6 +1269,20 @@ class AgentLoop:
         result = await self.commands.dispatch(cmd_ctx)
         if result is not None:
             ctx.outbound = result
+            # Shortcut commands skip BUILD and SAVE, so we must persist the
+            # turn here so WebUI history hydration after _turn_end sees the
+            # message.  Mark messages with _command so get_history can filter
+            # them out of LLM context.  /new is excluded because it
+            # intentionally clears the session.
+            if raw.lower() != "/new":
+                ctx.user_persisted_early = self._persist_user_message_early(
+                    ctx.msg, ctx.session, _command=True
+                )
+                ctx.session.add_message(
+                    "assistant", result.content, _command=True
+                )
+                self.sessions.save(ctx.session)
+                self._clear_pending_user_turn(ctx.session)
             return "shortcut"
         return "dispatch"
 
@@ -1405,14 +1308,18 @@ class AgentLoop:
             "include_timestamps": True,
         }
         ctx.history = ctx.session.get_history(**_hist_kwargs)
+        self._webui_turns.capture_title_context(
+            ctx.session_key,
+            ctx.msg,
+            self.llm_runtime(),
+        )
 
-        pending_ask_id = pending_ask_user_id(ctx.history)
         ctx.initial_messages = self._build_initial_messages(
-            ctx.msg, ctx.session, ctx.history, pending_ask_id, ctx.pending_summary,
+            ctx.msg, ctx.session, ctx.history, ctx.pending_summary,
             session_key=ctx.session_key,
         )
         ctx.user_persisted_early = self._persist_user_message_early(
-            ctx.msg, ctx.session, pending_ask_id
+            ctx.msg, ctx.session
         )
 
         if ctx.on_progress is None:
@@ -1423,6 +1330,7 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
+        await self._webui_turns.publish_run_status(ctx.msg, "running")
         result = await self._run_agent_loop(
             ctx.initial_messages,
             on_progress=ctx.on_progress,
@@ -1450,15 +1358,14 @@ class AgentLoop:
             ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
         ctx.save_skip = 1 + len(ctx.history) + (1 if ctx.user_persisted_early else 0)
-        skip_msgs = ctx.all_messages[ctx.save_skip:]
-        ctx.generated_media = generated_image_paths_from_messages(skip_msgs)
-        last_msg = ctx.all_messages[-1] if ctx.all_messages else None
-        if ctx.generated_media and last_msg and last_msg.get("role") == "assistant":
-            existing_media = last_msg.get("media")
-            media = existing_media if isinstance(existing_media, list) else []
-            last_msg["media"] = list(dict.fromkeys([*media, *ctx.generated_media]))
 
-        self._save_turn(ctx.session, ctx.all_messages, ctx.save_skip)
+        ctx.turn_latency_ms = max(0, int((time.time() - ctx.turn_wall_started_at) * 1000))
+        self._save_turn(
+            ctx.session, ctx.all_messages, ctx.save_skip,
+            turn_latency_ms=ctx.turn_latency_ms,
+        )
+        if ctx.msg.channel == "websocket":
+            self._pending_turn_latency_ms[ctx.session_key] = ctx.turn_latency_ms
         ctx.session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
@@ -1478,8 +1385,8 @@ class AgentLoop:
             ctx.all_messages,
             ctx.stop_reason,
             ctx.had_injections,
-            ctx.generated_media,
             ctx.on_stream,
+            turn_latency_ms=ctx.turn_latency_ms,
         )
         return "ok"
 
@@ -1523,10 +1430,18 @@ class AgentLoop:
 
         return filtered
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    def _save_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+        *,
+        turn_latency_ms: int | None = None,
+    ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
 
+        last_assistant_idx: int | None = None
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
@@ -1541,24 +1456,14 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                    # Strip the entire runtime-context block (including any session summary).
-                    # The block is bounded by _RUNTIME_CONTEXT_TAG and _RUNTIME_CONTEXT_END.
-                    end_marker = ContextBuilder._RUNTIME_CONTEXT_END
-                    end_pos = content.find(end_marker)
-                    if end_pos >= 0:
-                        after = content[end_pos + len(end_marker):].lstrip("\n")
-                        if after:
-                            entry["content"] = after
-                        else:
-                            continue
+                if isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content:
+                    # Strip the runtime-context block appended at the end.
+                    tag_pos = content.find(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                    before = content[:tag_pos].rstrip("\n ")
+                    if before:
+                        entry["content"] = before
                     else:
-                        # Fallback: no end marker found, strip the tag prefix
-                        after_tag = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG):].lstrip("\n")
-                        if after_tag.strip():
-                            entry["content"] = after_tag
-                        else:
-                            continue
+                        continue
                 if isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
                     if not filtered:
@@ -1566,6 +1471,10 @@ class AgentLoop:
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
+            if role == "assistant":
+                last_assistant_idx = len(session.messages) - 1
+        if turn_latency_ms is not None and last_assistant_idx is not None:
+            session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
         session.updated_at = datetime.now()
 
     _SUBAGENT_TASK_INDEX_KEY = "subagent_task_index"
@@ -1677,7 +1586,7 @@ class AgentLoop:
             task_summary=task_summary or None,
             sender_id=msg.sender_id,
         )
-        final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
+        final_content, _, all_msgs, _, _ = await self._run_agent_loop(
             messages, session=session, channel=channel, chat_id=chat_id,
             message_id=(msg.metadata or {}).get("message_id"),
             metadata=msg.metadata,
@@ -1689,23 +1598,19 @@ class AgentLoop:
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
         self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
-        options = ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else []
-        content, buttons = ask_user_outbound(
-            final_content or "Background task completed.",
-            options,
-            channel,
-        )
+        content = final_content or "Background task completed."
         # Slack threads encode thread_ts in the session key as
         # ``slack:<chat_id>:<thread_ts>``. Recover it here so the reply lands
         # in the originating thread rather than the channel top-level.
         outbound_metadata: dict[str, Any] = {}
         if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
             outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
+        if origin_message_id := (msg.metadata or {}).get("origin_message_id"):
+            outbound_metadata["origin_message_id"] = origin_message_id
         return OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
-            buttons=buttons,
             metadata=outbound_metadata,
         )
 

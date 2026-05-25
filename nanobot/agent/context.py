@@ -6,13 +6,17 @@ import platform
 from contextlib import suppress
 from importlib.resources import files as pkg_files
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from nanobot.agent.dashscope_memory import DashscopeMemoryClient
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.agent.tools import mcp as mcp_tools
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.apps.cli import utils as cli_app_utils
+from nanobot.bus.events import InboundMessage
+from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
-    build_assistant_message,
     current_time_str,
     detect_image_mime,
     truncate_text,
@@ -35,10 +39,36 @@ def _subagent_status_text(status: str | None) -> str:
     return _SUBAGENT_STATUS_TEXT.get(status, status)
 
 
+def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return persisted kwargs for turn-attached capabilities."""
+    return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
+
+
+def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
+    """Return model-visible runtime annotations for turn-attached capabilities."""
+    return [
+        *cli_app_utils.runtime_lines(msg, workspace, skip=skip),
+        *mcp_tools.runtime_lines(
+            msg,
+            configured_server_names=set(state._mcp_servers),
+            connected_server_names=set(state._mcp_stacks),
+            skip=skip,
+        ),
+    ]
+
+
+async def connect_mcp(state: Any, tools: ToolRegistry) -> None:
+    await mcp_tools.connect_missing_servers(state, tools)
+
+
+async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolRegistry) -> bool:
+    return await mcp_tools.handle_runtime_control(state, msg, tools)
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -66,6 +96,8 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+
+        parts.append(render_template("agent/tool_contract.md"))
 
         # Long-term memory is managed entirely by Dashscope. Relevant
         # memories are retrieved per-message in build_messages() and injected
@@ -122,16 +154,21 @@ class ContextBuilder:
 
     @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
         sender_id: str | None = None,
         task_summary: str | None = None,
+        supplemental_lines: Sequence[str] | None = None,
     ) -> str:
-        """Build untrusted runtime metadata block for injection before the user message."""
+        """Build untrusted runtime metadata block appended after user content."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         if sender_id:
             lines += [f"Sender ID: {sender_id}"]
+        if supplemental_lines:
+            lines.extend(supplemental_lines)
         if task_summary:
             lines += ["", "[Background Tasks]", task_summary]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
@@ -240,6 +277,8 @@ class ContextBuilder:
         session_summary: str | None = None,
         model: str | None = None,
         task_summary: str | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        current_runtime_lines: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         # Retrieve long-term memories relevant to the current message
@@ -252,10 +291,19 @@ class ContextBuilder:
             except Exception:
                 pass
 
+        # Supplemental runtime lines: sustained-goal state (upstream) plus any
+        # caller-provided lines, surfaced inside the runtime-context block.
+        extra = [
+            *goal_state_runtime_lines(session_metadata),
+        ]
+        if current_runtime_lines:
+            extra.extend(line for line in current_runtime_lines if line)
+
         runtime_ctx = self._build_runtime_context(
             channel, chat_id, self.timezone,
             sender_id=sender_id,
             task_summary=task_summary,
+            supplemental_lines=extra or None,
         )
         user_content = self._build_user_content(current_message, media)
         system_prompt = self.build_system_prompt(
@@ -320,27 +368,3 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
-
-    def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: Any,
-    ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
-        return messages
-
-    def add_assistant_message(
-        self, messages: list[dict[str, Any]],
-        content: str | None,
-        tool_calls: list[dict[str, Any]] | None = None,
-        reasoning_content: str | None = None,
-        thinking_blocks: list[dict] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
-        return messages

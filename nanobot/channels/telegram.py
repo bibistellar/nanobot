@@ -261,12 +261,20 @@ class TelegramChannel(BaseChannel):
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
         BotCommand("history", "Show recent conversation messages"),
+        BotCommand("goal", "Start a sustained objective (long-running task)"),
+        BotCommand("pairing", "Manage DM pairing (approve/deny/list)"),
         BotCommand("model", "Show or switch the current model"),
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
         BotCommand("help", "Show available commands"),
     ]
+
+    # Regex for slash commands routed to AgentLoop via ``_forward_command``.
+    # Hyphenated ``dream-*`` commands stay on a separate handler (below).
+    TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
+        r"^/(?:new|stop|restart|status|dream|history|goal|pairing|model)(?:@\w+)?(?:\s+.*)?$"
+    )
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -355,7 +363,7 @@ class TelegramChannel(BaseChannel):
         # Add command handlers (using Regex to support @username suffixes before bot initialization)
         # In groups, only respond to commands explicitly directed at this bot
         # (e.g. /new@nanostellar_bot). In private chats, bare /new works.
-        _cmd_names = r"new|stop|restart|status|dream|model|history"
+        _cmd_names = r"new|stop|restart|status|dream|history|goal|pairing|model"
         _cmd_names_hyphen = r"dream-log|dream_log|dream-restore|dream_restore"
         _bot_suffix = r"@" + (self._bot_username or r"\w+")
 
@@ -1149,6 +1157,7 @@ class TelegramChannel(BaseChannel):
             content=content,
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
+            is_dm=message.chat.type == "private",
         )
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

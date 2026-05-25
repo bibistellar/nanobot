@@ -8,6 +8,7 @@ from typing import Any
 
 from nanobot.agent.hook import AgentHook, SDKCaptureHook
 from nanobot.agent.loop import AgentLoop
+from nanobot.providers.image_generation import image_gen_provider_configs
 
 
 @dataclass(slots=True)
@@ -71,10 +72,7 @@ class Nanobot:
 
         loop = AgentLoop.from_config(
             config,
-            image_generation_provider_configs={
-                "openrouter": config.providers.openrouter,
-                "aihubmix": config.providers.aihubmix,
-            },
+            image_generation_provider_configs=image_gen_provider_configs(config),
             dashscope_client=dashscope_client,
             system_to_user_models=defaults.system_to_user_models,
         )

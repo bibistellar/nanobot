@@ -65,10 +65,19 @@ class DreamConfig(Base):
     # history.jsonl into history.archive.jsonl (never deleted). 0 = disabled
     # (only the hard max-entries cap archives overflow).
     short_term_retention_days: int = Field(
-        default=0,
+        default=3,
         ge=0,
         validation_alias=AliasChoices("shortTermRetentionDays", "short_term_retention_days"),
         serialization_alias="shortTermRetentionDays",
+    )
+    # Long-term (Dashscope) curation cadence — the nightly "sleep" pass that
+    # reviews all memory and prunes stale/redundant nodes. Self-gated to run at
+    # most once per this many hours (Dream fires every interval_h).
+    curation_min_interval_h: int = Field(
+        default=24,
+        ge=1,
+        validation_alias=AliasChoices("curationMinIntervalH", "curation_min_interval_h"),
+        serialization_alias="curationMinIntervalH",
     )
 
     def build_schedule(self, timezone: str) -> CronSchedule:

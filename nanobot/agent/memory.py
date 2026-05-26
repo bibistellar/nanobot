@@ -60,6 +60,8 @@ class MemoryStore:
         self.user_file = workspace / "USER.md"
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        self._curation_epoch_file = self.memory_dir / ".curation_epoch"
+        self.pruned_backup_file = self.memory_dir / "dashscope_pruned.jsonl"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._git = GitStore(workspace, tracked_files=[
@@ -458,6 +460,26 @@ class MemoryStore:
 
     def set_last_dream_cursor(self, cursor: int) -> None:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
+
+    # -- long-term curation bookkeeping --------------------------------------
+
+    def get_curation_epoch(self) -> float:
+        """Epoch seconds of the last long-term curation run (0.0 if never)."""
+        if self._curation_epoch_file.exists():
+            with suppress(ValueError, OSError):
+                return float(self._curation_epoch_file.read_text(encoding="utf-8").strip())
+        return 0.0
+
+    def set_curation_epoch(self, epoch: float) -> None:
+        self._curation_epoch_file.write_text(str(epoch), encoding="utf-8")
+
+    def append_pruned_backup(self, nodes: list[dict[str, Any]]) -> None:
+        """Durably append pruned long-term nodes to dashscope_pruned.jsonl (recoverable)."""
+        with open(self.pruned_backup_file, "a", encoding="utf-8") as f:
+            for node in nodes:
+                f.write(json.dumps(node, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     # -- message formatting utility ------------------------------------------
 
@@ -957,6 +979,7 @@ class Dream:
         self.annotate_line_ages = annotate_line_ages
         self.dashscope = dashscope_client
         self.short_term_retention_days = short_term_retention_days
+        self.curation_min_interval_h = 24  # nightly long-term curation gate (hours)
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1179,4 +1202,65 @@ class Dream:
         self.store.set_last_dream_cursor(new_cursor)
         self.store.compact_history(retention_days=self.short_term_retention_days)
         logger.info("Dream done: cursor advanced to {}", new_cursor)
+        return True
+
+    async def curate(self) -> bool:
+        """Nightly long-term memory curation (the "sleep" phase).
+
+        Reviews ALL Dashscope memory nodes and prunes stale/redundant ones.
+        Self-gated to run at most once per ``curation_min_interval_h``. Pruned
+        node contents are backed up to ``memory/dashscope_pruned.jsonl`` before
+        deletion so the operation is recoverable. Returns True if it pruned.
+        """
+        if not self.dashscope:
+            return False
+
+        now = datetime.now().timestamp()
+        last = self.store.get_curation_epoch()
+        if last and (now - last) < self.curation_min_interval_h * 3600:
+            return False
+
+        try:
+            nodes = self.dashscope.list_all_memory()
+        except Exception:
+            logger.exception("Dream curation: failed to list long-term memory")
+            return False
+
+        # Too few nodes to bother curating; just mark the gate.
+        if len(nodes) < 12:
+            self.store.set_curation_epoch(now)
+            return False
+
+        from nanobot.utils.memory_curation import evaluate_prunable
+
+        try:
+            delete_ids = await evaluate_prunable(nodes, self.provider, self.model)
+        except Exception:
+            logger.exception("Dream curation: evaluation failed; will retry next cycle")
+            return False  # leave the gate so it retries
+
+        if not delete_ids:
+            self.store.set_curation_epoch(now)
+            logger.info("Dream curation: nothing to prune ({} nodes)", len(nodes))
+            return False
+
+        by_id = {n.get("memory_node_id"): n for n in nodes}
+        pruned: list[dict[str, Any]] = []
+        for nid in delete_ids:
+            node = by_id.get(nid)
+            if node is None:
+                continue
+            try:
+                if self.dashscope.delete_memory(nid):
+                    pruned.append(node)
+            except Exception:
+                logger.warning("Dream curation: delete failed for {}", nid)
+
+        if pruned:
+            self.store.append_pruned_backup(pruned)
+        self.store.set_curation_epoch(now)
+        logger.info(
+            "Dream curation: pruned {}/{} nodes (backed up to {})",
+            len(pruned), len(nodes), self.store.pruned_backup_file.name,
+        )
         return True

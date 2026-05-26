@@ -92,9 +92,31 @@ class DashscopeMemoryClient:
         return "\n".join(lines)
 
     def list_memory(self) -> list[dict[str, Any]]:
-        """List all memories for the current user."""
+        """List the first page of memories for the current user."""
         result = self._request("list", {})
         return result.get("memory_nodes", [])
+
+    def list_all_memory(self, page_size: int = 100, max_pages: int = 100) -> list[dict[str, Any]]:
+        """List ALL memory nodes for the current user, following pagination.
+
+        The Memory API returns ``total`` and ``page_num``/``page_size``; we page
+        until we have collected ``total`` nodes (or hit ``max_pages`` as a guard).
+        """
+        nodes: list[dict[str, Any]] = []
+        page = 1
+        while page <= max_pages:
+            result = self._request("list", {"page_num": page, "page_size": page_size})
+            batch = result.get("memory_nodes", [])
+            if not batch:
+                break
+            nodes.extend(batch)
+            total = result.get("total")
+            if total is not None and len(nodes) >= total:
+                break
+            if len(batch) < page_size:
+                break
+            page += 1
+        return nodes
 
     def delete_memory(self, memory_node_id: str) -> bool:
         """Delete a specific memory node."""

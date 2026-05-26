@@ -1083,54 +1083,39 @@ class Dream:
             logger.exception("Dream Phase 1 failed")
             return False
 
-        # Phase 2 (Dashscope-only): Skip local MEMORY.md rewrite. Long-term
-        # memory is managed entirely by Dashscope. The Phase 1 analysis is
-        # synced to Dashscope below along with the raw batch entries.
-        result = None
-        changelog: list[str] = []
+        # Phase 2 (local MEMORY.md rewrite) is intentionally skipped: long-term
+        # memory is managed entirely by Dashscope. Sync the Phase 1 analysis
+        # (LLM-curated summary, as an assistant message so Dashscope extracts
+        # high-quality facts) plus the raw batch entries as user context, then
+        # advance the cursor once the sync succeeds. If Dashscope isn't
+        # configured the cursor advances immediately (the batch is "processed").
+        new_cursor = batch[-1]["cursor"]
+        synced = True
 
-        # Only advance cursor on successful completion to prevent silent loss
-        if result and result.stop_reason == "completed":
-            new_cursor = batch[-1]["cursor"]
-            self.store.set_last_dream_cursor(new_cursor)
-            logger.info(
-                "Dream done: {} change(s), cursor advanced to {}",
-                len(changelog), new_cursor,
-            )
-        else:
-            reason = result.stop_reason if result else "exception"
-            logger.warning(
-                "Dream incomplete ({}): cursor NOT advanced, will retry next cron cycle",
-                reason,
-            )
-
-        self.store.compact_history()
-
-        # Git auto-commit (only when there are actual changes)
-        if changelog and self.store.git.is_initialized():
-            ts = batch[-1]["timestamp"]
-            summary = f"dream: {ts}, {len(changelog)} change(s)"
-            commit_msg = f"{summary}\n\n{analysis.strip()}"
-            sha = self.store.git.auto_commit(commit_msg)
-            if sha:
-                logger.info("Dream commit: {}", sha)
-
-        # Sync to Dashscope long-term memory. Send the Phase 1 analysis
-        # (LLM-curated summary) as an assistant message so Dashscope extracts
-        # high-quality facts, plus the raw batch entries as user context.
         if self.dashscope and batch:
             try:
-                messages = []
-                for entry in batch:
-                    content = entry.get("content", "")
-                    if content:
-                        messages.append({"role": "user", "content": content})
+                messages = [
+                    {"role": "user", "content": entry["content"]}
+                    for entry in batch
+                    if entry.get("content")
+                ]
                 if analysis:
                     messages.append({"role": "assistant", "content": analysis})
                 if messages:
                     self.dashscope.add_memory(messages)
-                    logger.info("Dream: synced {} entries + analysis to Dashscope", len(messages))
+                    logger.info(
+                        "Dream: synced {} entries + analysis to Dashscope", len(messages)
+                    )
             except Exception as e:
-                logger.warning("Dream: Dashscope sync failed: {}", e)
+                synced = False
+                logger.warning("Dream: Dashscope sync failed, cursor NOT advanced: {}", e)
 
+        if not synced:
+            # Leave the cursor untouched so this batch retries next cycle. The
+            # failed add_memory persisted nothing, so no duplication results.
+            return False
+
+        self.store.set_last_dream_cursor(new_cursor)
+        self.store.compact_history()
+        logger.info("Dream done: cursor advanced to {}", new_cursor)
         return True

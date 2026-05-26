@@ -1661,19 +1661,16 @@ class AgentLoop:
         decision_prompt = (
             "[Cron Task Result]\n"
             f"Original task: {task_message}\n"
-            f"Subagent status: {subagent_status}\n"
-            f"Delivery target: {deliver_channel}:{deliver_chat_id}\n\n"
+            f"Subagent status: {subagent_status}\n\n"
             "--- Subagent output (begin) ---\n"
             f"{subagent_result}\n"
             "--- Subagent output (end) ---\n\n"
-            "Decide whether this result warrants notifying the user. "
-            "If yes, call the `message` tool with target_channel='" + deliver_channel + "' "
-            "and chat_id='" + deliver_chat_id + "' carrying a brief, natural message "
-            "in the user's language. Speak directly to them; do not include task "
-            "ids, status reports, or self-references. "
+            "If this result is worth telling the user, reply with the message to "
+            "send them: a brief, natural note in the user's language, speaking "
+            "directly to them (no task ids, status reports, or self-references). "
+            "Do NOT call any tools — just write the message as your reply. "
             "If the result is routine and not worth interrupting the user "
-            "(e.g. a periodic check with no anomaly), respond with empty content "
-            "and do not call any tools."
+            "(e.g. a periodic check with no anomaly), reply with empty content."
         )
 
         key = f"{deliver_channel}:{deliver_chat_id}"
@@ -1705,16 +1702,30 @@ class AgentLoop:
             pending_queue=pending_queue,
         )
 
-        # If the LLM used the message tool, delivery already happened via the
-        # tool's send callback. Suppress any additional outbound to avoid a
-        # second send.
+        # If the LLM ignored the instruction and used the message tool, it has
+        # already sent — nothing more to do here (and nothing left to gate).
         if isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
         if not final_content or not final_content.strip():
             return None
 
-        # Fallback: the LLM didn't use the message tool but produced text.
-        # Deliver it as a plain channel message.
+        # Gate the candidate notification through the same evaluator the
+        # heartbeat path uses, so routine "all-normal" cron checks don't spam
+        # the user. Mirrors upstream's evaluator-gated cron delivery, which our
+        # local cron refactor had dropped. evaluate_response defaults to notify
+        # on failure, so important results are never silently lost.
+        from nanobot.utils.evaluator import evaluate_response
+
+        should_notify = await evaluate_response(
+            final_content, task_message, self.provider, self.model,
+        )
+        if not should_notify:
+            logger.info(
+                "Cron result suppressed by evaluator (routine): job={} ({})",
+                job_id, job_name,
+            )
+            return None
+
         return OutboundMessage(
             channel=deliver_channel,
             chat_id=deliver_chat_id,

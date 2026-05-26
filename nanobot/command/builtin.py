@@ -196,6 +196,22 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+def _fetch_model_ids(api_base: str, api_key: str) -> list[str]:
+    """Fetch available model IDs from a provider's OpenAI-style /v1/models.
+
+    Blocking (urllib); callers MUST run it via ``asyncio.to_thread`` so the
+    synchronous request can never stall the event loop / Telegram poller.
+    """
+    import json
+    import urllib.request
+
+    url = f"{api_base.rstrip('/')}/models"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 (provider api_base)
+        data = json.loads(resp.read().decode())
+    return sorted(m["id"] for m in data.get("data", []))
+
+
 async def cmd_model(ctx: CommandContext) -> OutboundMessage:
     """Show current model or switch to a different one.
 
@@ -209,23 +225,22 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
     target = raw[len("/model"):].strip() if raw.startswith("/model") else ""
 
     if not target:
-        # List available models by querying the provider's /v1/models endpoint
+        # List available models by querying the provider's /v1/models endpoint.
+        # The fetch is synchronous (urllib), so run it off the event loop and
+        # bound it with a timeout — otherwise a slow or hung request (e.g. via
+        # the cluster proxy) freezes the whole agent and drops the Telegram
+        # poller, leaving the bot unable to receive any further messages.
+        api_base = getattr(loop.provider, "api_base", "") or ""
+        api_key = getattr(loop.provider, "api_key", "") or ""
         model_ids: list[str] = []
-        try:
-            import json
-            import urllib.request
-            api_base = getattr(loop.provider, "api_base", "") or ""
-            api_key = getattr(loop.provider, "api_key", "") or ""
-            if api_base:
-                url = f"{api_base.rstrip('/')}/models"
-                req = urllib.request.Request(url, headers={
-                    "Authorization": f"Bearer {api_key}",
-                })
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode())
-                    model_ids = sorted(m["id"] for m in data.get("data", []))
-        except Exception:
-            pass
+        if api_base:
+            try:
+                model_ids = await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_model_ids, api_base, api_key),
+                    timeout=8,
+                )
+            except Exception:
+                model_ids = []
 
         # Build interactive buttons: each model as a "/model <name>" callback
         buttons: list[list[str]] = []

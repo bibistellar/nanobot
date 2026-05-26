@@ -70,6 +70,14 @@ class DreamConfig(Base):
         validation_alias=AliasChoices("shortTermRetentionDays", "short_term_retention_days"),
         serialization_alias="shortTermRetentionDays",
     )
+    # Model used for long-term curation (dedup/prune) judgment. A capable model
+    # matters here — weak models both miss duplicates and wrongly prune durable
+    # rules. Empty string falls back to the agent's main model.
+    curation_model: str = Field(
+        default="claude-sonnet-4-6",
+        validation_alias=AliasChoices("curationModel", "curation_model"),
+        serialization_alias="curationModel",
+    )
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
         if self.cron:

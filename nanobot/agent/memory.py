@@ -968,6 +968,7 @@ class Dream:
         self.annotate_line_ages = annotate_line_ages
         self.dashscope = dashscope_client
         self.short_term_retention_days = short_term_retention_days
+        self.curation_model = ""  # eval model for curation; "" = use self.model
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1197,8 +1198,9 @@ class Dream:
 
         from nanobot.utils.memory_curation import evaluate_prunable
 
+        eval_model = self.curation_model or self.model
         try:
-            delete_ids = await evaluate_prunable(nodes, self.provider, self.model)
+            delete_ids = await evaluate_prunable(nodes, self.provider, eval_model)
         except Exception:
             logger.exception("Dream curation: evaluation failed")
             return 0

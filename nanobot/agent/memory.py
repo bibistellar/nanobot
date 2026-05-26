@@ -54,6 +54,7 @@ class MemoryStore:
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
+        self.history_archive_file = self.memory_dir / "history.archive.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
@@ -319,15 +320,73 @@ class MemoryStore:
         """Return history entries with a valid cursor > *since_cursor*."""
         return [e for e, c in self._iter_valid_entries() if c > since_cursor]
 
-    def compact_history(self) -> None:
-        """Drop oldest entries if the file exceeds *max_history_entries*."""
-        if self.max_history_entries <= 0:
-            return
+    def compact_history(self, *, retention_days: int = 0) -> None:
+        """Archive aged-out, already-consolidated entries out of the active log.
+
+        Entries are *moved* to ``history.archive.jsonl`` (never deleted) once
+        they are BOTH (a) already consolidated into long-term memory — i.e. at
+        or below the last Dream cursor — AND (b) older than *retention_days*
+        (when > 0). The ``max_history_entries`` cap is enforced as a hard safety
+        bound, but it too only ever archives consolidated entries, so
+        unprocessed short-term history is never lost.
+        """
         entries = self._read_entries()
-        if len(entries) <= self.max_history_entries:
+        if not entries:
             return
-        kept = entries[-self.max_history_entries:]
-        self._write_entries(kept)
+
+        dream_cursor = self.get_last_dream_cursor()
+        cutoff = (
+            datetime.now().timestamp() - retention_days * 86400
+            if retention_days > 0 else None
+        )
+
+        keep: list[dict[str, Any]] = []
+        archive: list[dict[str, Any]] = []
+        for e in entries:
+            consolidated = e.get("cursor", 0) <= dream_cursor
+            aged_out = cutoff is not None and self._entry_epoch(e) < cutoff
+            if consolidated and aged_out:
+                archive.append(e)
+            else:
+                keep.append(e)
+
+        # Hard safety cap: if still oversized, archive the OLDEST consolidated
+        # entries beyond the cap — never drop unconsolidated short-term data.
+        if self.max_history_entries > 0 and len(keep) > self.max_history_entries:
+            overflow = len(keep) - self.max_history_entries
+            trimmed: list[dict[str, Any]] = []
+            for e in keep:
+                if overflow > 0 and e.get("cursor", 0) <= dream_cursor:
+                    archive.append(e)
+                    overflow -= 1
+                else:
+                    trimmed.append(e)
+            keep = trimmed
+
+        if not archive:
+            return
+        self._append_archive(archive)
+        self._write_entries(keep)
+        logger.info(
+            "History: archived {} consolidated entr(ies), {} kept active",
+            len(archive), len(keep),
+        )
+
+    def _entry_epoch(self, entry: dict[str, Any]) -> float:
+        """Best-effort epoch seconds for an entry's timestamp (0.0 if unparsable)."""
+        ts = entry.get("timestamp") or ""
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            with suppress(ValueError):
+                return datetime.strptime(ts, fmt).timestamp()
+        return 0.0
+
+    def _append_archive(self, entries: list[dict[str, Any]]) -> None:
+        """Durably append entries to history.archive.jsonl."""
+        with open(self.history_archive_file, "a", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     # -- JSONL helpers -------------------------------------------------------
 
@@ -884,6 +943,7 @@ class Dream:
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
         dashscope_client: Any | None = None,
+        short_term_retention_days: int = 0,
     ):
         self.store = store
         self.provider = provider
@@ -896,6 +956,7 @@ class Dream:
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
         self.dashscope = dashscope_client
+        self.short_term_retention_days = short_term_retention_days
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1116,6 +1177,6 @@ class Dream:
             return False
 
         self.store.set_last_dream_cursor(new_cursor)
-        self.store.compact_history()
+        self.store.compact_history(retention_days=self.short_term_retention_days)
         logger.info("Dream done: cursor advanced to {}", new_cursor)
         return True

@@ -60,6 +60,16 @@ class DreamConfig(Base):
     # on — set to False to feed MEMORY.md raw if a specific LLM reacts poorly
     # to the `← Nd` suffix or you want deterministic, git-independent prompts.
     annotate_line_ages: bool = True
+    # Short-term history retention (days). Entries already consolidated into
+    # long-term (Dashscope) AND older than this are archived out of the active
+    # history.jsonl into history.archive.jsonl (never deleted). 0 = disabled
+    # (only the hard max-entries cap archives overflow).
+    short_term_retention_days: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices("shortTermRetentionDays", "short_term_retention_days"),
+        serialization_alias="shortTermRetentionDays",
+    )
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

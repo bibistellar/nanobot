@@ -1055,6 +1055,7 @@ def _run_gateway(
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
+    agent.dream.short_term_retention_days = dream_cfg.short_term_retention_days
     from nanobot.cron.types import CronJob, CronPayload
 
     async def _run_dream(agent_, _job):

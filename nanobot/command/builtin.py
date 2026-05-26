@@ -318,7 +318,7 @@ def _model_command_status(loop) -> str:
 
 
 async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
-    """Manually trigger a Dream consolidation run."""
+    """Manually trigger the unified memory-organize ("sleep") pass."""
     import time
 
     loop = ctx.loop
@@ -327,12 +327,18 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     async def _run_dream():
         t0 = time.monotonic()
         try:
-            did_work = await loop.dream.run()
+            summary = await loop.dream.run()
             elapsed = time.monotonic() - t0
-            if did_work:
-                content = f"Dream completed in {elapsed:.1f}s."
+            consolidated = summary.get("consolidated", 0)
+            pruned = summary.get("pruned", 0)
+            if consolidated or pruned:
+                content = (
+                    f"Dream organize done in {elapsed:.1f}s — "
+                    f"consolidated {consolidated} short-term batch(es) → long-term, "
+                    f"pruned {pruned} stale long-term node(s)."
+                )
             else:
-                content = "Dream: nothing to process."
+                content = f"Dream: nothing to organize ({elapsed:.1f}s)."
         except Exception as e:
             elapsed = time.monotonic() - t0
             content = f"Dream failed after {elapsed:.1f}s: {e}"

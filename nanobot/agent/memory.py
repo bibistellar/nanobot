@@ -60,7 +60,6 @@ class MemoryStore:
         self.user_file = workspace / "USER.md"
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self._curation_epoch_file = self.memory_dir / ".curation_epoch"
         self.pruned_backup_file = self.memory_dir / "dashscope_pruned.jsonl"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
@@ -462,16 +461,6 @@ class MemoryStore:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
 
     # -- long-term curation bookkeeping --------------------------------------
-
-    def get_curation_epoch(self) -> float:
-        """Epoch seconds of the last long-term curation run (0.0 if never)."""
-        if self._curation_epoch_file.exists():
-            with suppress(ValueError, OSError):
-                return float(self._curation_epoch_file.read_text(encoding="utf-8").strip())
-        return 0.0
-
-    def set_curation_epoch(self, epoch: float) -> None:
-        self._curation_epoch_file.write_text(str(epoch), encoding="utf-8")
 
     def append_pruned_backup(self, nodes: list[dict[str, Any]]) -> None:
         """Durably append pruned long-term nodes to dashscope_pruned.jsonl (recoverable)."""
@@ -979,7 +968,6 @@ class Dream:
         self.annotate_line_ages = annotate_line_ages
         self.dashscope = dashscope_client
         self.short_term_retention_days = short_term_retention_days
-        self.curation_min_interval_h = 24  # nightly long-term curation gate (hours)
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1093,8 +1081,38 @@ class Dream:
             result += "\n"
         return result
 
-    async def run(self) -> bool:
-        """Process unprocessed history entries. Returns True if work was done."""
+    async def run(self) -> dict[str, int]:
+        """Unified daily memory organization — the "sleep" phase.
+
+        One action that organizes the whole memory library:
+          1. consolidate ALL pending short-term history into long-term (Dashscope),
+          2. archive aged-out short-term out of the active log,
+          3. curate long-term: dedup + prune stale/redundant nodes.
+
+        Scheduled once per day and also safe to trigger on demand via /dream.
+        Returns a summary ``{"consolidated": batches, "pruned": nodes}``.
+        """
+        consolidated = 0
+        for _ in range(self._MAX_ORGANIZE_BATCHES):
+            if not await self._consolidate_batch():
+                break
+            consolidated += 1
+
+        self.store.compact_history(retention_days=self.short_term_retention_days)
+        pruned = await self._curate_longterm()
+
+        logger.info(
+            "Dream organize: consolidated {} batch(es), pruned {} long-term node(s)",
+            consolidated, pruned,
+        )
+        return {"consolidated": consolidated, "pruned": pruned}
+
+    async def _consolidate_batch(self) -> bool:
+        """Consolidate one batch of unprocessed short-term history into long-term.
+
+        Returns True if a batch was processed (cursor advanced), False if there
+        was nothing to do or the sync failed (cursor left intact for retry).
+        """
         last_cursor = self.store.get_last_dream_cursor()
         entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
@@ -1102,48 +1120,20 @@ class Dream:
 
         batch = entries[: self.max_batch_size]
         logger.info(
-            "Dream: processing {} entries (cursor {}→{}), batch={}",
+            "Dream: consolidating {} entries (cursor {}→{}), batch={}",
             len(entries), last_cursor, batch[-1]["cursor"], len(batch),
         )
 
-        # Build history text for LLM — cap each entry so a legacy oversized
-        # record (e.g. pre-#3412 raw_archive dump) can't blow up the prompt.
         history_text = "\n".join(
             f"[{e['timestamp']}] "
             f"{truncate_text(e['content'], self._HISTORY_ENTRY_PREVIEW_MAX_CHARS)}"
             for e in batch
         )
 
-        # Current file contents + per-line age annotations (MEMORY.md only).
-        # Each file is capped in the *prompt preview* only; Phase 2 still sees
-        # the full file via the read_file tool.
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        raw_memory = self.store.read_memory() or "(empty)"
-        annotated_memory = (
-            self._annotate_with_ages(raw_memory)
-            if self.annotate_line_ages
-            else raw_memory
-        )
-        current_memory = truncate_text(annotated_memory, self._MEMORY_FILE_MAX_CHARS)
-        current_soul = truncate_text(
-            self.store.read_soul() or "(empty)", self._SOUL_FILE_MAX_CHARS,
-        )
-        current_user = truncate_text(
-            self.store.read_user() or "(empty)", self._USER_FILE_MAX_CHARS,
-        )
-
-        file_context = (
-            f"## Current Date\n{current_date}\n\n"
-            f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
-            f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
-            f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
-        )
-
-        # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
-        phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
-        )
-
+        # Phase 1: LLM-curate the batch into a concise summary so Dashscope
+        # extracts high-quality long-term facts. Local MEMORY.md/SOUL.md/USER.md
+        # are no longer fed or rewritten — long-term lives in Dashscope, and
+        # SOUL/USER are human-maintained identity files.
         try:
             phase1_response = await self.provider.chat_with_retry(
                 model=self.model,
@@ -1156,27 +1146,18 @@ class Dream:
                             stale_threshold_days=_STALE_THRESHOLD_DAYS,
                         ),
                     },
-                    {"role": "user", "content": phase1_prompt},
+                    {"role": "user", "content": f"## Conversation History\n{history_text}"},
                 ],
                 tools=None,
                 tool_choice=None,
             )
             analysis = phase1_response.content or ""
-            logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
         except Exception:
-            logger.exception("Dream Phase 1 failed")
+            logger.exception("Dream: Phase 1 consolidation failed")
             return False
 
-        # Phase 2 (local MEMORY.md rewrite) is intentionally skipped: long-term
-        # memory is managed entirely by Dashscope. Sync the Phase 1 analysis
-        # (LLM-curated summary, as an assistant message so Dashscope extracts
-        # high-quality facts) plus the raw batch entries as user context, then
-        # advance the cursor once the sync succeeds. If Dashscope isn't
-        # configured the cursor advances immediately (the batch is "processed").
         new_cursor = batch[-1]["cursor"]
-        synced = True
-
-        if self.dashscope and batch:
+        if self.dashscope:
             try:
                 messages = [
                     {"role": "user", "content": entry["content"]}
@@ -1191,58 +1172,39 @@ class Dream:
                         "Dream: synced {} entries + analysis to Dashscope", len(messages)
                     )
             except Exception as e:
-                synced = False
+                # Failed add_memory persisted nothing; leave cursor for retry.
                 logger.warning("Dream: Dashscope sync failed, cursor NOT advanced: {}", e)
-
-        if not synced:
-            # Leave the cursor untouched so this batch retries next cycle. The
-            # failed add_memory persisted nothing, so no duplication results.
-            return False
+                return False
 
         self.store.set_last_dream_cursor(new_cursor)
-        self.store.compact_history(retention_days=self.short_term_retention_days)
-        logger.info("Dream done: cursor advanced to {}", new_cursor)
         return True
 
-    async def curate(self) -> bool:
-        """Nightly long-term memory curation (the "sleep" phase).
+    async def _curate_longterm(self) -> int:
+        """Review ALL long-term memory and prune stale/redundant nodes.
 
-        Reviews ALL Dashscope memory nodes and prunes stale/redundant ones.
-        Self-gated to run at most once per ``curation_min_interval_h``. Pruned
-        node contents are backed up to ``memory/dashscope_pruned.jsonl`` before
-        deletion so the operation is recoverable. Returns True if it pruned.
+        Pruned node contents are backed up to ``memory/dashscope_pruned.jsonl``
+        before deletion (recoverable). Returns the number of nodes pruned.
         """
         if not self.dashscope:
-            return False
-
-        now = datetime.now().timestamp()
-        last = self.store.get_curation_epoch()
-        if last and (now - last) < self.curation_min_interval_h * 3600:
-            return False
-
+            return 0
         try:
             nodes = self.dashscope.list_all_memory()
         except Exception:
             logger.exception("Dream curation: failed to list long-term memory")
-            return False
-
-        # Too few nodes to bother curating; just mark the gate.
-        if len(nodes) < 12:
-            self.store.set_curation_epoch(now)
-            return False
+            return 0
+        if len(nodes) < 12:  # too few to bother deduping
+            return 0
 
         from nanobot.utils.memory_curation import evaluate_prunable
 
         try:
             delete_ids = await evaluate_prunable(nodes, self.provider, self.model)
         except Exception:
-            logger.exception("Dream curation: evaluation failed; will retry next cycle")
-            return False  # leave the gate so it retries
-
+            logger.exception("Dream curation: evaluation failed")
+            return 0
         if not delete_ids:
-            self.store.set_curation_epoch(now)
             logger.info("Dream curation: nothing to prune ({} nodes)", len(nodes))
-            return False
+            return 0
 
         by_id = {n.get("memory_node_id"): n for n in nodes}
         pruned: list[dict[str, Any]] = []
@@ -1258,9 +1220,10 @@ class Dream:
 
         if pruned:
             self.store.append_pruned_backup(pruned)
-        self.store.set_curation_epoch(now)
         logger.info(
             "Dream curation: pruned {}/{} nodes (backed up to {})",
             len(pruned), len(nodes), self.store.pruned_backup_file.name,
         )
-        return True
+        return len(pruned)
+
+    _MAX_ORGANIZE_BATCHES = 50  # safety cap on batches drained per organize run

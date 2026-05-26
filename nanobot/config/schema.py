@@ -47,7 +47,7 @@ class DreamConfig(Base):
 
     _HOUR_MS = 3_600_000
 
-    interval_h: int = Field(default=2, ge=1)  # Every 2 hours by default
+    interval_h: int = Field(default=24, ge=1)  # Daily "organize memory" pass
     cron: str | None = Field(default=None, exclude=True)  # Legacy compatibility override
     model_override: str | None = Field(
         default=None,
@@ -70,16 +70,6 @@ class DreamConfig(Base):
         validation_alias=AliasChoices("shortTermRetentionDays", "short_term_retention_days"),
         serialization_alias="shortTermRetentionDays",
     )
-    # Long-term (Dashscope) curation cadence — the nightly "sleep" pass that
-    # reviews all memory and prunes stale/redundant nodes. Self-gated to run at
-    # most once per this many hours (Dream fires every interval_h).
-    curation_min_interval_h: int = Field(
-        default=24,
-        ge=1,
-        validation_alias=AliasChoices("curationMinIntervalH", "curation_min_interval_h"),
-        serialization_alias="curationMinIntervalH",
-    )
-
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
         if self.cron:

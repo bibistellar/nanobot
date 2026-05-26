@@ -1056,13 +1056,11 @@ def _run_gateway(
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
     agent.dream.short_term_retention_days = dream_cfg.short_term_retention_days
-    agent.dream.curation_min_interval_h = dream_cfg.curation_min_interval_h
     from nanobot.cron.types import CronJob, CronPayload
 
     async def _run_dream(agent_, _job):
+        # Unified daily "organize memory": consolidate short-term + curate long-term.
         await agent_.dream.run()
-        # Nightly long-term curation (self-gated to once / curation_min_interval_h).
-        await agent_.dream.curate()
 
     register_system_event("dream", _run_dream)
     cron.register_system_job(CronJob(

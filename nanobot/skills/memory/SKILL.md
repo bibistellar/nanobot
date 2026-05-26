@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Two-layer memory system with Dream-managed knowledge files.
+description: Two-layer memory — local short-term history + Dashscope long-term, organized by Dream.
 always: true
 ---
 
@@ -8,29 +8,38 @@ always: true
 
 ## Structure
 
-- `SOUL.md` — Bot personality and communication style. **Managed by Dream.** Do NOT edit.
-- `USER.md` — User profile and preferences. **Managed by Dream.** Do NOT edit.
-- `memory/MEMORY.md` — Long-term facts (project context, important events). **Managed by Dream.** Do NOT edit.
-- `memory/history.jsonl` — append-only JSONL, not loaded into context. Prefer the built-in `grep` tool to search it.
+- **Short-term memory** — `memory/history.jsonl`: an append-only log of recent
+  conversation turns. Recent unprocessed entries are surfaced as "Recent
+  History" in context. Not loaded wholesale — search it with the `grep` tool.
+- **Long-term memory** — Dashscope: durable facts. Relevant memories are
+  retrieved automatically per message and shown in `[Long-term Memory]` blocks
+  before the user's message. Use the memory-manage flow to search/add when needed.
+- `SOUL.md` (personality/tone) and `USER.md` (user profile) — **human-maintained
+  identity files.** They are read into context but are NOT auto-managed; edit
+  them directly when the user asks you to change persona or profile.
 
-## Search Past Events
+## How Dream organizes memory
 
-`memory/history.jsonl` is JSONL format — each line is a JSON object with `cursor`, `timestamp`, `content`.
+Dream runs once a day (and on demand via `/dream`) as a single "organize" pass:
 
-- For broad searches, start with `grep(..., path="memory", glob="*.jsonl", output_mode="count")` or the default `files_with_matches` mode before expanding to full content
-- Use `output_mode="content"` plus `context_before` / `context_after` when you need the exact matching lines
-- Use `fixed_strings=true` for literal timestamps or JSON fragments
-- Use `head_limit` / `offset` to page through long histories
-- Use `exec` only as a last-resort fallback when the built-in search cannot express what you need
+1. **Consolidate** recent short-term history into Dashscope long-term memory.
+2. **Archive** short-term entries that are consolidated and older than the
+   retention window out of the active log into `memory/history.archive.jsonl`
+   (archived, never deleted).
+3. **Curate** long-term: deduplicate and prune stale/superseded nodes (pruned
+   contents are backed up to `memory/dashscope_pruned.jsonl`).
 
-Examples (replace `keyword`):
-- `grep(pattern="keyword", path="memory/history.jsonl", case_insensitive=true)`
-- `grep(pattern="2026-04-02 10:00", path="memory/history.jsonl", fixed_strings=true)`
-- `grep(pattern="keyword", path="memory", glob="*.jsonl", output_mode="count", case_insensitive=true)`
-- `grep(pattern="oauth|token", path="memory", glob="*.jsonl", output_mode="content", case_insensitive=true)`
+## Search past events
 
-## Important
+`memory/history.jsonl` is JSONL — each line has `cursor`, `timestamp`, `content`.
 
-- **Do NOT edit SOUL.md, USER.md, or MEMORY.md.** They are automatically managed by Dream.
-- If you notice outdated information, it will be corrected when Dream runs next.
-- Users can view Dream's activity with the `/dream-log` command.
+- Broad search: `grep(pattern="keyword", path="memory", glob="*.jsonl", output_mode="count", case_insensitive=true)`
+- Exact lines: add `output_mode="content"` plus `context_before`/`context_after`.
+- Literal timestamps/JSON: `fixed_strings=true`. Page with `head_limit`/`offset`.
+- Older archived turns live in `memory/history.archive.jsonl`.
+
+## Notes
+
+- `/dream` manually triggers the organize pass and reports a summary
+  (consolidated / pruned counts).
+- Long-term memory is curated automatically; you don't manually edit it.

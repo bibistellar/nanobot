@@ -1249,6 +1249,17 @@ class AgentLoop:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         mark_webui_session(ctx.session, msg.metadata)
 
+        # Record the chat's human-readable title/type so the cross-session
+        # roster (sessions tool) can name this chat (e.g. a group) instead of
+        # showing a bare chat_id.
+        _md = msg.metadata or {}
+        _title = _md.get("chat_title")
+        if _title and ctx.session.metadata.get("title") != _title:
+            ctx.session.metadata["title"] = _title
+            if _ctype := _md.get("chat_type"):
+                ctx.session.metadata["chat_type"] = _ctype
+            self.sessions.save(ctx.session)
+
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
         if self._restore_pending_user_turn(ctx.session):

@@ -956,12 +956,21 @@ class TelegramChannel(BaseChannel):
     def _build_message_metadata(message, user) -> dict:
         """Build common Telegram inbound metadata payload."""
         reply_to = getattr(message, "reply_to_message", None)
+        chat = message.chat
+        chat_title = (
+            getattr(chat, "title", None)
+            or " ".join(filter(None, [getattr(chat, "first_name", None), getattr(chat, "last_name", None)]))
+            or getattr(chat, "username", None)
+            or ""
+        )
         return {
             "message_id": message.message_id,
             "user_id": user.id,
             "username": user.username,
             "first_name": user.first_name,
             "is_group": message.chat.type != "private",
+            "chat_title": chat_title,
+            "chat_type": message.chat.type,
             "message_thread_id": getattr(message, "message_thread_id", None),
             "is_forum": bool(getattr(message.chat, "is_forum", False)),
             "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,

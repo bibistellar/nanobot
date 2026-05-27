@@ -568,6 +568,44 @@ class AgentLoop:
             return True
         return False
 
+    @staticmethod
+    def _capture_chat_metadata(session: Session, metadata: dict[str, Any] | None) -> bool:
+        """Record a chat's human-readable title/type onto the session.
+
+        Lets the cross-session roster (sessions tool) name this chat (e.g. a
+        group) instead of showing a bare chat_id. Returns True if anything
+        changed so the caller can persist.
+        """
+        md = metadata or {}
+        title = md.get("chat_title")
+        if title and session.metadata.get("title") != title:
+            session.metadata["title"] = title
+            if ctype := md.get("chat_type"):
+                session.metadata["chat_type"] = ctype
+            return True
+        return False
+
+    async def _record_passive_message(self, msg: InboundMessage) -> None:
+        """Append a non-addressed message (e.g. group chatter) to history.
+
+        Runs no turn — it only gives the bot context it can read later (directly
+        or via cross-session reads). Serialized on the per-session lock so it
+        never races an active turn, which mutates the same cached Session object.
+        """
+        key = self._effective_session_key(msg)
+        text = msg.content if isinstance(msg.content, str) else ""
+        if not text.strip():
+            return
+        lock = self._session_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            try:
+                session = self.sessions.get_or_create(key)
+                self._capture_chat_metadata(session, msg.metadata)
+                session.add_message("user", text, **agent_context.session_extra(msg.metadata))
+                self.sessions.save(session)
+            except Exception:
+                logger.exception("Failed to record passive message for session {}", key)
+
     def _build_initial_messages(
         self,
         msg: InboundMessage,
@@ -809,6 +847,13 @@ class AgentLoop:
                 continue
             except Exception as e:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
+                continue
+
+            # Passive records (e.g. un-addressed group chatter) are appended to
+            # history for context but must never trigger a turn or be injected
+            # into a running one — handle them before runtime/command routing.
+            if isinstance(msg.metadata, dict) and msg.metadata.get("_record_only"):
+                self._schedule_background(self._record_passive_message(msg))
                 continue
 
             if await agent_context.handle_runtime_control(self, msg, self.tools):
@@ -1252,12 +1297,7 @@ class AgentLoop:
         # Record the chat's human-readable title/type so the cross-session
         # roster (sessions tool) can name this chat (e.g. a group) instead of
         # showing a bare chat_id.
-        _md = msg.metadata or {}
-        _title = _md.get("chat_title")
-        if _title and ctx.session.metadata.get("title") != _title:
-            ctx.session.metadata["title"] = _title
-            if _ctype := _md.get("chat_type"):
-                ctx.session.metadata["chat_type"] = _ctype
+        if self._capture_chat_metadata(ctx.session, msg.metadata):
             self.sessions.save(ctx.session)
 
         if self._restore_runtime_checkpoint(ctx.session):

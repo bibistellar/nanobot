@@ -24,7 +24,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
@@ -1118,6 +1118,68 @@ class TelegramChannel(BaseChannel):
         reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
         return bool(bot_id and reply_user and reply_user.id == bot_id)
 
+    @staticmethod
+    def _group_sender_prefix(user) -> str:
+        """`[First Last @handle]: ` tag so the agent can tell group members apart."""
+        sender_name = user.first_name or ""
+        if user.last_name:
+            sender_name += f" {user.last_name}"
+        sender_tag = f"@{user.username}" if user.username else f"(id:{user.id})"
+        return f"[{sender_name} {sender_tag}]: "
+
+    @staticmethod
+    def _passive_media_placeholder(message) -> str:
+        """Short text stand-in for a media-only message (no download)."""
+        for attr, label in (
+            ("photo", "photo"),
+            ("video", "video"),
+            ("animation", "GIF"),
+            ("voice", "voice message"),
+            ("audio", "audio"),
+            ("document", "document"),
+            ("sticker", "sticker"),
+            ("video_note", "video note"),
+            ("location", "location"),
+        ):
+            if getattr(message, attr, None):
+                return f"[{label}]"
+        return ""
+
+    async def _record_group_message_passively(self, message, user, sender_id: str) -> None:
+        """Record an un-addressed group message to history for context only.
+
+        Cheap by design: text/caption (or a lightweight media placeholder), no
+        media download, no typing/reaction indicators. Flagged ``_record_only``
+        so AgentLoop appends it to the chat's history but runs no turn, and
+        published directly to the bus so it is captured regardless of sender
+        (group awareness needs every participant, not just allow-listed ones).
+        """
+        parts: list[str] = []
+        if message.text:
+            parts.append(message.text)
+        if message.caption:
+            parts.append(message.caption)
+        if not parts:
+            placeholder = self._passive_media_placeholder(message)
+            if placeholder:
+                parts.append(placeholder)
+        content = "\n".join(parts).strip()
+        if not content:
+            return
+        content = self._group_sender_prefix(user) + content
+        metadata = self._build_message_metadata(message, user)
+        metadata["_record_only"] = True
+        self._remember_thread_context(message)
+        msg = InboundMessage(
+            channel=self.name,
+            sender_id=str(sender_id),
+            chat_id=str(message.chat_id),
+            content=content,
+            metadata=metadata,
+            session_key_override=self._derive_topic_session_key(message),
+        )
+        await self.bus.publish_inbound(msg)
+
     def _remember_thread_context(self, message) -> None:
         """Cache Telegram thread context by chat/message id for follow-up replies."""
         message_thread_id = getattr(message, "message_thread_id", None)
@@ -1179,6 +1241,19 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
+
+        # Un-addressed group chatter (no @mention, not a reply to the bot, and
+        # group_policy != open): record it to history for context so the bot
+        # stays aware of the conversation, but never act on it. Recorded for any
+        # sender — group awareness needs the whole room, not just allow-listed
+        # users — and bypasses the command-permission gate below (recording is
+        # not acting; the bot still only responds when addressed by an allowed
+        # sender).
+        if not await self._is_group_message_for_bot(message):
+            await self._record_group_message_passively(message, user, sender_id)
+            return
+
+        # From here the message is meant for the bot — enforce permissions.
         if not self.is_allowed(sender_id):
             return
         self._remember_thread_context(message)
@@ -1189,9 +1264,6 @@ class TelegramChannel(BaseChannel):
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
-
-        if not await self._is_group_message_for_bot(message):
-            return
 
         # Build content from text and/or media
         content_parts = []
@@ -1233,11 +1305,7 @@ class TelegramChannel(BaseChannel):
 
         # In group chats, prefix message with sender info so the agent can distinguish users
         if message.chat.type != "private":
-            sender_name = user.first_name or ""
-            if user.last_name:
-                sender_name += f" {user.last_name}"
-            sender_tag = f"@{user.username}" if user.username else f"(id:{user.id})"
-            content = f"[{sender_name} {sender_tag}]: {content}"
+            content = self._group_sender_prefix(user) + content
 
         self.logger.debug("message from {}: {}...", sender_id, content[:50])
 

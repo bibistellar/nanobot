@@ -1,6 +1,6 @@
 ---
 name: cross-session
-description: Act on and read other chats/sessions (e.g. do something in a group from a DM).
+description: Act on, read, and proactively look up other chats/sessions, cron jobs, and memory when the user references context outside the current chat.
 always: true
 ---
 
@@ -26,6 +26,27 @@ group?"), do NOT say you don't know it — look it up:
    grep `"role"` and read `content`. Note: large tool outputs are offloaded
    (shown as `[tool output persisted]` pointers), so you'll see the conversation
    text but not full tool results.
+
+## Look it up before saying "I don't know"
+
+Just as often, the user won't *tell* you to switch chats — they'll **refer to
+something that lives outside the current chat** and assume you can find it:
+
+- "the morning-greeting task **you set up** for Chen", "didn't you already
+  schedule that?" → a job you created. **List your cron jobs** (`cron` tool,
+  `action: "list"`) — the job and its details (target chat_id, message) are
+  there. Don't ask the user for an id you already saved.
+- "what we agreed **in the group**", "Chen's chat_id", "continue what they were
+  discussing" → it happened in another session. **Find that session** (`sessions`
+  tool) and **read its history** (`read_file`/`grep` on its `file`).
+- a fact about a person/project you can't see locally → **grep your memory**
+  (`grep` under the memory dir) and rely on shared long-term memory.
+
+So when the user references a person, task, decision, or id you don't have in
+*this* chat, treat it as "I need to go find it", not "I don't have it". Search
+your cron jobs, your other sessions, and your memory FIRST; only ask the user
+once those genuinely come up empty. Saying "I don't know X" while X is one
+`cron list`/`sessions`/`grep` away is the mistake to avoid.
 
 Long-term memory (Dashscope) is already shared across all sessions, so durable
 facts learned in one chat surface in others automatically. Use the steps above

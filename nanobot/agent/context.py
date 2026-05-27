@@ -110,8 +110,9 @@ class ContextBuilder:
                 "before the user's message. You can also proactively search or "
                 "add memories using the memory-manage skill when needed.\n\n"
                 "For routine task logs (health checks, image upgrades, upstream sync), "
-                "write results to `memory/task_log.md` with timestamps. Keep only the "
-                "last 7 days of entries."
+                "append each day's results to a per-day dated file "
+                "`memory/task_log/<YYYY-MM-DD>.md` (one file per day, named by that "
+                "day's date); never merge multiple days into one file."
             )
 
         always_skills = self.skills.get_always_skills()

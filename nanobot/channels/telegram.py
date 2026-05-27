@@ -264,6 +264,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("goal", "Start a sustained objective (long-running task)"),
         BotCommand("pairing", "Manage DM pairing (approve/deny/list)"),
         BotCommand("model", "Show or switch the current model"),
+        BotCommand("cron", "List cron jobs, or run one now (debug)"),
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
@@ -273,7 +274,7 @@ class TelegramChannel(BaseChannel):
     # Regex for slash commands routed to AgentLoop via ``_forward_command``.
     # Hyphenated ``dream-*`` commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
-        r"^/(?:new|stop|restart|status|dream|history|goal|pairing|model)(?:@\w+)?(?:\s+.*)?$"
+        r"^/(?:new|stop|restart|status|dream|history|goal|pairing|model|cron)(?:@\w+)?(?:\s+.*)?$"
     )
 
     @classmethod
@@ -363,7 +364,7 @@ class TelegramChannel(BaseChannel):
         # Add command handlers (using Regex to support @username suffixes before bot initialization)
         # In groups, only respond to commands explicitly directed at this bot
         # (e.g. /new@nanostellar_bot). In private chats, bare /new works.
-        _cmd_names = r"new|stop|restart|status|dream|history|goal|pairing|model"
+        _cmd_names = r"new|stop|restart|status|dream|history|goal|pairing|model|cron"
         _cmd_names_hyphen = r"dream-log|dream_log|dream-restore|dream_restore"
         _bot_suffix = r"@" + (self._bot_username or r"\w+")
 

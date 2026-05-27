@@ -18,7 +18,7 @@ from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 
 _CRON_PARAMETERS = tool_parameters_schema(
-    action=StringSchema("Action to perform", enum=["add", "list", "remove"]),
+    action=StringSchema("Action to perform", enum=["add", "list", "remove", "run"]),
     name=StringSchema(
         "Optional short human-readable label for the job "
         "(e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message."
@@ -49,11 +49,15 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "task in one chat but wants the result delivered elsewhere "
         "(e.g. asks in a group but wants results in DM).",
     ),
-    job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
+    job_id=StringSchema(
+        "REQUIRED when action='remove' or action='run'. Job ID (obtain via action='list')."
+    ),
     required=["action"],
     description=(
         "Action-specific parameters: add requires a non-empty message plus one schedule "
-        "(every_seconds, cron_expr, or at); remove requires job_id; list only needs action. "
+        "(every_seconds, cron_expr, or at); remove and run require job_id; list only needs action. "
+        "action='run' fires an existing job NOW through its real execution path (subagent + "
+        "delivery), e.g. to re-run a failed daily task on demand. "
         "Per-action requirements are enforced at runtime (see field descriptions) so the "
         "top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that "
         "reject oneOf/anyOf/allOf/enum/not at the root of function parameters."
@@ -136,6 +140,8 @@ class CronTool(Tool, ContextAware):
             errors.append("message is required when action='add'")
         if action == "remove" and not str(params.get("job_id") or "").strip():
             errors.append("job_id is required when action='remove'")
+        if action == "run" and not str(params.get("job_id") or "").strip():
+            errors.append("job_id is required when action='run'")
         return errors
 
     async def execute(
@@ -162,6 +168,10 @@ class CronTool(Tool, ContextAware):
             return self._list_jobs()
         elif action == "remove":
             return self._remove_job(job_id)
+        elif action == "run":
+            if self._in_cron_context.get():
+                return "Error: cannot trigger a cron job from within a cron job execution"
+            return await self._run_job(job_id)
         return f"Unknown action: {action}"
 
     @staticmethod
@@ -323,3 +333,19 @@ class CronTool(Tool, ContextAware):
                 "This is a protected system-managed cron job."
             )
         return f"Job {job_id} not found"
+
+    async def _run_job(self, job_id: str | None) -> str:
+        if not job_id:
+            return "Error: job_id is required for run"
+        job = self._cron.get_job(job_id)
+        if job is None:
+            return f"Job {job_id} not found"
+        # force=True so disabled jobs can still be triggered on demand.
+        ok = await self._cron.run_job(job_id, force=True)
+        if ok:
+            return (
+                f"Triggered job `{job.name}` (id: {job_id}) now via its normal cron "
+                "path (subagent execution + delivery). Results are logged and you'll "
+                "be notified per the job's own rules."
+            )
+        return f"Failed to trigger job {job_id}"

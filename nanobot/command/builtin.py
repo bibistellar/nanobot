@@ -74,6 +74,13 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "<goal>",
     ),
     BuiltinCommandSpec(
+        "/cron",
+        "List/run cron jobs",
+        "List scheduled cron jobs, or trigger one now (debug): /cron [id-or-name].",
+        "clock",
+        "[id]",
+    ),
+    BuiltinCommandSpec(
         "/dream",
         "Run Dream",
         "Manually trigger memory consolidation.",
@@ -654,6 +661,62 @@ def build_help_text() -> str:
     return "\n".join(lines)
 
 
+async def cmd_cron(ctx: CommandContext) -> OutboundMessage:
+    """List cron jobs, or trigger one now (debug): /cron [id-or-name]."""
+    loop = ctx.loop
+    msg = ctx.msg
+    meta = {**dict(msg.metadata or {}), "render_as": "text"}
+    cron = getattr(loop, "cron_service", None)
+    if cron is None:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Cron service is not available.", metadata=meta,
+        )
+
+    jobs = cron.list_jobs()
+    arg = ctx.args.strip()
+
+    if not arg:
+        if not jobs:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No cron jobs scheduled.", metadata=meta,
+            )
+        lines = ["Cron jobs:"]
+        lines += [f"- {j.name}  (id: `{j.id}`)" for j in jobs]
+        lines.append("\nTrigger one now: `/cron <id or name>`")
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="\n".join(lines), metadata=meta,
+        )
+
+    target = next((j for j in jobs if j.id == arg or j.name == arg), None)
+    if target is None:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"No cron job matching `{arg}`. Use /cron to list.", metadata=meta,
+        )
+
+    async def _trigger():
+        try:
+            await cron.run_job(target.id, force=True)
+        except Exception as e:
+            await loop.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Cron job `{target.name}` trigger errored: {e}", metadata=meta,
+            ))
+
+    loop._schedule_background(_trigger())
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=(
+            f"Triggered cron job `{target.name}` (id: {target.id}) now — runs through "
+            "the normal path (subagent + delivery); result arrives per the job's rules."
+        ),
+        metadata=meta,
+    )
+
+
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
@@ -667,6 +730,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/history ", cmd_history)
     router.exact("/goal", cmd_goal)
     router.prefix("/goal ", cmd_goal)
+    router.exact("/cron", cmd_cron)
+    router.prefix("/cron ", cmd_cron)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)

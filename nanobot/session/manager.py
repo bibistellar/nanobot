@@ -681,6 +681,9 @@ class SessionManager:
                             key = data.get("key") or path.stem.replace("_", ":", 1)
                             metadata = data.get("metadata", {})
                             title = metadata.get("title") if isinstance(metadata, dict) else None
+                            chat_type = (
+                                metadata.get("chat_type") if isinstance(metadata, dict) else None
+                            )
                             preview = ""
                             fallback_preview = ""
                             scanned_records = 0
@@ -712,6 +715,7 @@ class SessionManager:
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 "title": title if isinstance(title, str) else "",
+                                "chat_type": chat_type if isinstance(chat_type, str) else "",
                                 "preview": preview,
                                 "path": str(path)
                             })
@@ -725,6 +729,11 @@ class SessionManager:
                         "title": (
                             repaired.metadata.get("title")
                             if isinstance(repaired.metadata.get("title"), str)
+                            else ""
+                        ),
+                        "chat_type": (
+                            repaired.metadata.get("chat_type")
+                            if isinstance(repaired.metadata.get("chat_type"), str)
                             else ""
                         ),
                         "preview": next(

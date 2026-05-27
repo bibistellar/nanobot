@@ -53,8 +53,10 @@ class MessageTool(Tool, ContextAware):
         default_message_id: str | None = None,
         workspace: str | Path | None = None,
         restrict_to_workspace: bool = False,
+        sessions: Any | None = None,
     ):
         self._send_callback = send_callback
+        self._sessions = sessions
         self._workspace = (
             Path(workspace).expanduser() if workspace is not None else get_workspace_path()
         )
@@ -90,6 +92,7 @@ class MessageTool(Tool, ContextAware):
             send_callback=send_callback,
             workspace=ctx.workspace,
             restrict_to_workspace=ctx.config.restrict_to_workspace,
+            sessions=getattr(ctx, "sessions", None),
         )
 
     def set_context(self, ctx: RequestContext) -> None:
@@ -146,6 +149,41 @@ class MessageTool(Tool, ContextAware):
             "Do NOT use read_file to send files — that only reads content for your own analysis."
         )
 
+    def _known_chat_ids(self, channel: str) -> set[str]:
+        """Chat ids of sessions on `channel` (e.g. {'-5111011186', '8281248569'})."""
+        if self._sessions is None:
+            return set()
+        try:
+            ids: set[str] = set()
+            for s in self._sessions.list_sessions():
+                key = s.get("key", "")
+                ch, sep, cid = key.partition(":")
+                if sep and ch == channel and cid:
+                    ids.add(cid)
+            return ids
+        except Exception:
+            return set()
+
+    def _resolve_chat_id(self, channel: str, chat_id: str) -> str:
+        """Correct a mangled cross-chat target against the known session roster.
+
+        Telegram group ids are negative; the model frequently drops the leading
+        minus (or the `-100` supergroup prefix) when echoing an id back into the
+        tool call. If the given id is unknown but a sign/prefix variant is a real
+        session, use the real one. Unknown ids with no variant pass through (they
+        may be a legitimately new proactive target).
+        """
+        if not chat_id or chat_id.startswith("-"):
+            return chat_id
+        known = self._known_chat_ids(channel)
+        if not known or chat_id in known:
+            return chat_id
+        if chat_id.lstrip().isdigit():
+            for cand in (f"-{chat_id}", f"-100{chat_id}"):
+                if cand in known:
+                    return cand
+        return chat_id
+
     def _resolve_media(self, media: list[str]) -> list[str]:
         """Resolve local media attachments and enforce workspace restriction when enabled."""
         resolved: list[str] = []
@@ -198,6 +236,11 @@ class MessageTool(Tool, ContextAware):
                 "(e.g. anon-…) are not chat ids."
             )
         chat_id = chat_id or default_chat_id
+        # An explicit cross-chat target may have a mangled id (e.g. the model
+        # dropped the leading minus of a Telegram group). Correct it against the
+        # known session roster before sending.
+        if explicit_chat_id and not (channel == default_channel and chat_id == default_chat_id):
+            chat_id = self._resolve_chat_id(channel, chat_id)
         # Only inherit default message_id when targeting the same channel+chat.
         # Cross-chat sends must not carry the original message_id, because
         # some channels (e.g. Feishu) use it to determine the target

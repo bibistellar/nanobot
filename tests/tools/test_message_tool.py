@@ -38,6 +38,54 @@ async def test_message_tool_rejects_malformed_buttons(bad) -> None:
     assert result == "Error: buttons must be a list of list of strings"
 
 
+class _FakeSessions:
+    def __init__(self, keys: list[str]) -> None:
+        self._keys = keys
+
+    def list_sessions(self):
+        return [{"key": k} for k in self._keys]
+
+
+@pytest.mark.asyncio
+async def test_message_tool_corrects_mangled_telegram_group_id() -> None:
+    """The model often drops the leading minus of a negative Telegram group id
+    when echoing it into a cross-chat send. If the bare id is unknown but the
+    negative variant is a real session, deliver to the real chat."""
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(
+        send_callback=_send,
+        sessions=_FakeSessions(["telegram:-5111011186", "telegram:1752172576"]),
+    )
+
+    await tool.execute(content="hi group", channel="telegram", chat_id="5111011186")
+
+    assert sent[0].chat_id == "-5111011186"
+
+
+@pytest.mark.asyncio
+async def test_message_tool_leaves_known_and_unknown_ids_untouched() -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(
+        send_callback=_send,
+        sessions=_FakeSessions(["telegram:-5111011186", "telegram:1752172576"]),
+    )
+
+    # Known positive DM id stays as-is; unknown id with no variant passes through.
+    await tool.execute(content="dm", channel="telegram", chat_id="1752172576")
+    await tool.execute(content="new", channel="telegram", chat_id="999999")
+
+    assert sent[0].chat_id == "1752172576"
+    assert sent[1].chat_id == "999999"
+
+
 @pytest.mark.asyncio
 async def test_message_tool_marks_channel_delivery_only_when_enabled() -> None:
     sent: list[OutboundMessage] = []

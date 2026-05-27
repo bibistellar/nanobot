@@ -36,10 +36,11 @@ class SessionsTool(Tool):
         return (
             "List the chats/sessions you take part in — group chats and DMs across channels — "
             "so you can act on a chat other than the current one. Each entry has channel, "
-            "chat_id, title, last_active, file, and a short preview. To act in another chat: "
-            "send to it with the `message` tool (target channel + chat_id); to read its recent "
-            "conversation, use `read_file` or `grep` on the given `file` path. "
-            "Optional `channel` filter (e.g. 'telegram')."
+            "chat_id, title, chat_type (e.g. private/group/supergroup), last_active, file, and a "
+            "short preview. To act in another chat: send to it with the `message` tool (target "
+            "channel + chat_id) — pass chat_id EXACTLY as shown, including any leading '-' "
+            "(Telegram group ids are negative). To read its recent conversation, use `read_file` "
+            "or `grep` on the given `file` path. Optional `channel` filter (e.g. 'telegram')."
         )
 
     @classmethod
@@ -64,6 +65,7 @@ class SessionsTool(Tool):
                 "channel": ch,
                 "chat_id": cid,
                 "title": s.get("title") or "",
+                "chat_type": s.get("chat_type") or "",
                 "last_active": s.get("updated_at") or "",
                 "file": f"sessions/{Path(path).name}" if path else "",
                 "preview": (s.get("preview") or "")[:80],

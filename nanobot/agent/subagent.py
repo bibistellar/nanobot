@@ -127,6 +127,11 @@ class SubagentManager:
         ctx = ToolContext(
             config=cfg,
             workspace=str(root.resolve()),
+            # Bus is required for the `message` tool: without it MessageTool
+            # falls back to send_callback=None and every send returns
+            # "Error: Message sending not configured" — silently breaking any
+            # subagent task whose job is to deliver something.
+            bus=self.bus,
             file_state_store=FileStates(),
         )
         ToolLoader().load(ctx, registry, scope="subagent")

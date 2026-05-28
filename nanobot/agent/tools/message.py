@@ -45,6 +45,13 @@ from nanobot.config.paths import get_workspace_path
 class MessageTool(Tool, ContextAware):
     """Tool to send messages to users on chat channels."""
 
+    # Subagents (e.g. cron-spawned tasks) must be able to deliver too — without
+    # this scope the cron subagent has no `message` tool, runs to completion
+    # with an empty response, and the cron result evaluator reads "empty = no
+    # errors" → the user is silently told the task succeeded while the
+    # recipient gets nothing.
+    _scopes = {"core", "subagent"}
+
     def __init__(
         self,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,

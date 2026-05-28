@@ -75,6 +75,10 @@ class MessageTool(Tool, ContextAware):
             "message_default_metadata",
             default={},
         )
+        self._default_session_key: ContextVar[str] = ContextVar(
+            "message_default_session_key",
+            default="",
+        )
         self._sent_in_turn_var: ContextVar[bool] = ContextVar("message_sent_in_turn", default=False)
         self._turn_delivered_media_var: ContextVar[tuple[str, ...]] = ContextVar(
             "message_turn_delivered_media",
@@ -101,6 +105,7 @@ class MessageTool(Tool, ContextAware):
         self._default_chat_id.set(ctx.chat_id)
         self._default_message_id.set(ctx.message_id)
         self._default_metadata.set(dict(ctx.metadata or {}))
+        self._default_session_key.set(ctx.session_key or "")
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -269,6 +274,14 @@ class MessageTool(Tool, ContextAware):
             metadata["message_id"] = message_id
         if self._record_channel_delivery_var.get() or media:
             metadata["_record_channel_delivery"] = True
+        # Tag with the originating session so a terminal channel send failure
+        # can be routed back here as a delivery_failure event — the tool
+        # returns "sent" optimistically before the channel attempts delivery,
+        # so without this the agent never learns about a Forbidden / network
+        # / bad-id failure and keeps believing the send succeeded.
+        origin = self._default_session_key.get()
+        if origin:
+            metadata["_origin_session_key"] = origin
 
         msg = OutboundMessage(
             channel=channel,

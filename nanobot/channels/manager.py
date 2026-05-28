@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
@@ -454,6 +454,7 @@ class ChannelManager:
                         "Failed to send to {} after {} attempts",
                         msg.channel, max_attempts
                     )
+                    await self._publish_delivery_failure(msg, e)
                     return
                 delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
                 logger.warning(
@@ -464,6 +465,55 @@ class ChannelManager:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     raise  # Propagate cancellation during sleep
+
+    async def _publish_delivery_failure(
+        self, msg: OutboundMessage, err: BaseException
+    ) -> None:
+        """Surface a terminal send failure back to the agent that issued it.
+
+        The ``message`` tool returns "Message sent ..." as soon as the outbound
+        is enqueued on the bus, before the channel attempts real delivery — so
+        an agent (and any task log it wrote) keeps believing the send succeeded
+        even when Telegram replies ``Forbidden`` or a media upload 404s. The
+        tool tags every outbound with ``_origin_session_key``; on terminal
+        failure we route a system inbound to that session so the agent's next
+        turn sees the failure and can correct any prior "success" claim and
+        notify the user.
+        """
+        origin_key = (msg.metadata or {}).get("_origin_session_key")
+        if not origin_key:
+            return
+        err_text = f"{type(err).__name__}: {err}"
+        try:
+            await self.bus.publish_inbound(InboundMessage(
+                channel="system",
+                sender_id="system",
+                chat_id=origin_key,
+                content=(
+                    f"[delivery_failure] Your earlier `message` tool call to "
+                    f"`{msg.channel}:{msg.chat_id}` did NOT actually reach the "
+                    f"recipient. Error: {err_text}.\n\n"
+                    f"The `message` tool returns optimistically before the "
+                    f"channel attempts real delivery, so any 'sent' confirmation "
+                    f"you saw is misleading. Correct any prior claim that the "
+                    f"send succeeded (e.g. the user, task logs, memory), and "
+                    f"surface this to the user if appropriate. Common causes: "
+                    f"Telegram Forbidden = the recipient never started the bot "
+                    f"(they must DM /start first); Chat not found = wrong id."
+                ),
+                metadata={
+                    "type": "delivery_failure",
+                    "target_channel": msg.channel,
+                    "target_chat_id": msg.chat_id,
+                    "error": err_text,
+                },
+                session_key_override=origin_key,
+            ))
+        except Exception:
+            logger.exception(
+                "Failed to publish delivery_failure event for {}:{}",
+                msg.channel, msg.chat_id,
+            )
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

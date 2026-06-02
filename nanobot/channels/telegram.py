@@ -1219,23 +1219,50 @@ class TelegramChannel(BaseChannel):
     async def _record_group_message_passively(self, message, user, sender_id: str) -> None:
         """Record an un-addressed group message to history for context only.
 
-        Cheap by design: text/caption (or a lightweight media placeholder), no
-        media download, no typing/reaction indicators. Flagged ``_record_only``
-        so AgentLoop appends it to the chat's history but runs no turn, and
-        published directly to the bus so it is captured regardless of sender
-        (group awareness needs every participant, not just allow-listed ones).
+        Mostly cheap: text/caption never blocks, photo attachments are
+        downloaded so the agent loop can run a one-shot vision describe and
+        persist a real summary (otherwise a chat-image's content is invisible
+        to future turns — we don't re-embed historical images as vision
+        blocks). Voice/video/audio/etc. stay as lightweight text placeholders;
+        transcription is out of scope here and busy groups would balloon disk.
+        Flagged ``_record_only`` so AgentLoop appends to history but runs no
+        turn, and published directly to the bus so it is captured regardless
+        of sender (group awareness needs every participant, not just
+        allow-listed ones).
         """
         parts: list[str] = []
         if message.text:
             parts.append(message.text)
         if message.caption:
             parts.append(message.caption)
-        if not parts:
+
+        media_paths: list[str] = []
+        if getattr(message, "photo", None):
+            try:
+                downloaded, _ = await self._download_message_media(
+                    message, add_failure_content=False,
+                )
+                media_paths = [
+                    p for p in downloaded
+                    if Path(p).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+                ]
+            except Exception:
+                self.logger.exception(
+                    "passive recording: photo download failed for chat {}",
+                    message.chat_id,
+                )
+                media_paths = []
+
+        # Only fall back to the "[photo]" / "[voice]" placeholder when we have
+        # no real media to hand off — otherwise the loop's vision describe
+        # produces a better breadcrumb.
+        if not parts and not media_paths:
             placeholder = self._passive_media_placeholder(message)
             if placeholder:
                 parts.append(placeholder)
+
         content = "\n".join(parts).strip()
-        if not content:
+        if not content and not media_paths:
             return
         content = self._group_sender_prefix(user) + content
         metadata = self._build_message_metadata(message, user)
@@ -1246,6 +1273,7 @@ class TelegramChannel(BaseChannel):
             sender_id=str(sender_id),
             chat_id=str(message.chat_id),
             content=content,
+            media=media_paths,
             metadata=metadata,
             session_key_override=self._derive_topic_session_key(message),
         )

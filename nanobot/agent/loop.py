@@ -58,6 +58,7 @@ from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.utils.passive_vision import describe_image_for_history
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
     SUSTAINED_GOAL_CONTINUE_PROMPT,
@@ -660,17 +661,37 @@ class AgentLoop:
         Runs no turn — it only gives the bot context it can read later (directly
         or via cross-session reads). Serialized on the per-session lock so it
         never races an active turn, which mutates the same cached Session object.
+
+        Images attached to a passive message are described by a one-shot vision
+        call (see [passive_vision][]) *before* taking the lock; the resulting
+        ``[image: …]`` line is folded into the persisted text so subsequent
+        turns see the content without having to re-embed the raw bytes.
         """
         key = self._effective_session_key(msg)
         text = msg.content if isinstance(msg.content, str) else ""
-        if not text.strip():
+        media = [p for p in (msg.media or []) if isinstance(p, str) and p]
+        if not text.strip() and not media:
             return
+
+        descriptions: list[str] = []
+        for path in media:
+            desc = await describe_image_for_history(path, self.provider, self.model)
+            descriptions.append(desc or "image")
+
+        final_text = text.rstrip()
+        for desc in descriptions:
+            line = f"[image: {desc}]"
+            final_text = (final_text + "\n" + line) if final_text else line
+
         lock = self._session_locks.setdefault(key, asyncio.Lock())
         async with lock:
             try:
                 session = self.sessions.get_or_create(key)
                 self._capture_chat_metadata(session, msg.metadata)
-                session.add_message("user", text, **agent_context.session_extra(msg.metadata))
+                extra: dict[str, Any] = (
+                    {"media": list(media)} if media else {}
+                ) | agent_context.session_extra(msg.metadata)
+                session.add_message("user", final_text, **extra)
                 self.sessions.save(session)
             except Exception:
                 logger.exception("Failed to record passive message for session {}", key)

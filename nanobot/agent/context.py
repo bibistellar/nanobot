@@ -3,8 +3,6 @@
 import base64
 import mimetypes
 import platform
-from contextlib import suppress
-from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -19,6 +17,7 @@ from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
+    load_bundled_template,
     truncate_text,
 )
 from nanobot.utils.prompt_templates import render_template
@@ -89,11 +88,13 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         channel: str | None = None,
         session_summary: str | None = None,
+        workspace: Path | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity(channel=channel)]
+        root = workspace or self.workspace
+        parts = [self._get_identity(channel=channel, workspace=root)]
 
-        bootstrap = self._load_bootstrap_files()
+        bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
             parts.append(bootstrap)
 
@@ -139,9 +140,10 @@ class ContextBuilder:
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None) -> str:
+    def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""
-        workspace_path = str(self.workspace.expanduser().resolve())
+        root = workspace or self.workspace
+        workspace_path = str(root.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -188,12 +190,13 @@ class ContextBuilder:
 
         return _to_blocks(left) + _to_blocks(right)
 
-    def _load_bootstrap_files(self) -> str:
+    def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
+        root = workspace or self.workspace
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
+            file_path = root / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
@@ -203,10 +206,9 @@ class ContextBuilder:
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
         """Check if *content* is identical to the bundled template (user hasn't customized it)."""
-        with suppress(Exception):
-            tpl = pkg_files("nanobot") / "templates" / template_path
-            if tpl.is_file():
-                return content.strip() == tpl.read_text(encoding="utf-8").strip()
+        tpl = load_bundled_template(template_path)
+        if tpl is not None:
+            return content.strip() == tpl.strip()
         return False
 
     def _should_inject_system_to_user(self, model: str) -> bool:
@@ -280,9 +282,16 @@ class ContextBuilder:
         task_summary: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
         current_runtime_lines: Sequence[str] | None = None,
+        workspace: Path | None = None,
+        runtime_state: Any | None = None,
+        inbound_message: Any | None = None,
+        skip_runtime_lines: bool = False,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
+        root = workspace or self.workspace
+
         # Retrieve long-term memories relevant to the current message
+        # (fork feature: shared Dashscope long-term memory across sessions).
         ltm_block = ""
         if self.dashscope and current_message:
             try:
@@ -292,11 +301,13 @@ class ContextBuilder:
             except Exception:
                 pass
 
-        # Supplemental runtime lines: sustained-goal state (upstream) plus any
+        # Supplemental runtime lines: sustained-goal state plus
         # caller-provided lines, surfaced inside the runtime-context block.
         extra = [
             *goal_state_runtime_lines(session_metadata),
         ]
+        if runtime_state is not None and inbound_message is not None:
+            extra.extend(runtime_lines(runtime_state, inbound_message, root, skip=skip_runtime_lines))
         if current_runtime_lines:
             extra.extend(line for line in current_runtime_lines if line)
 
@@ -322,11 +333,18 @@ class ContextBuilder:
 
         # Merge runtime context, long-term memory, and user content into a
         # single user message to avoid consecutive same-role messages.
+        # (Fork keeps the prefix-merge layout — upstream simplified this away
+        # but we still need `system_prefix` for CLIProxyAPI-style proxies
+        # that strip the system message, and `ltm_block` for Dashscope LTM.)
         if isinstance(user_content, str):
             merged = f"{system_prefix}{runtime_ctx}{ltm_block}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": f"{system_prefix}{runtime_ctx}{ltm_block}"}] + user_content
 
+        # `_project_history` renders our fork's structured `subagent_result`
+        # message type via subagent_announce.md and skips `subagent_spawned`.
+        # Upstream dropped this and feeds `history` raw — don't take that,
+        # subagent results would surface as wall-of-JSON to the LLM.
         projected_history = self._project_history(history)
 
         if inject_system:

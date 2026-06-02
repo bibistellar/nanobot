@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
@@ -114,6 +115,47 @@ class TurnContext:
     turn_latency_ms: int | None = None
 
     trace: list[StateTraceEntry] = field(default_factory=list)
+
+
+def _extract_cron_notification_text(
+    final_content: str | None,
+    all_msgs: list[dict[str, Any]],
+) -> str | None:
+    """Return the text the user actually saw from a cron decision turn.
+
+    Used by ``_handle_cron_result`` to persist the notification into session
+    history. The LLM may deliver it two ways:
+
+    1. As the assistant's final response text (``final_content``) — the cron
+       decision flow then publishes it as an ``OutboundMessage``.
+    2. By calling the ``message`` tool mid-turn, with the user-facing content
+       in the call's ``content`` argument. ``final_content`` is usually empty
+       in this case.
+
+    Falls back to the latest message-tool ``content`` arg only when there is
+    no plain final response — that way evaluator-gated text wins over a
+    stray tool call.
+    """
+    if final_content and final_content.strip():
+        return final_content.strip()
+    for m in reversed(all_msgs):
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict) or fn.get("name") != "message":
+                continue
+            args_raw = fn.get("arguments")
+            try:
+                args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+            except json.JSONDecodeError:
+                continue
+            content = args.get("content") if isinstance(args, dict) else None
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return None
 
 
 class AgentLoop:
@@ -1742,7 +1784,7 @@ class AgentLoop:
             model=self.model,
         )
 
-        final_content, _, _, _, _ = await self._run_agent_loop(
+        final_content, _, all_msgs, _, _ = await self._run_agent_loop(
             messages,
             session=session,
             channel=deliver_channel,
@@ -1753,9 +1795,31 @@ class AgentLoop:
             pending_queue=pending_queue,
         )
 
+        # Whatever the user actually saw in chat must land in session history.
+        # The decision-prompt and any tool dance during the cron decision turn
+        # stay out (those are cron-internal noise), but the *notification* —
+        # whether delivered via the message tool mid-turn or as the returned
+        # final_content — has to be persisted. Otherwise the next user turn
+        # has no context for it, and the bot rebuilds state from task_log
+        # files (or worse, contradicts what it just told the user).
+        notification_text = _extract_cron_notification_text(final_content, all_msgs)
+
+        def _persist_notification(text: str) -> None:
+            session.add_message(
+                "assistant",
+                text,
+                type="cron_notification",
+                cron_job_id=job_id,
+                cron_job_name=job_name,
+                _channel_delivery=True,
+            )
+            self.sessions.save(session)
+
         # If the LLM ignored the instruction and used the message tool, it has
         # already sent — nothing more to do here (and nothing left to gate).
         if isinstance(mt, MessageTool) and mt._sent_in_turn:
+            if notification_text:
+                _persist_notification(notification_text)
             return None
         if not final_content or not final_content.strip():
             return None
@@ -1776,6 +1840,11 @@ class AgentLoop:
                 job_id, job_name,
             )
             return None
+
+        # About to deliver via OutboundMessage; persist before publish so the
+        # assistant turn is in session history by the time the channel sends.
+        if notification_text:
+            _persist_notification(notification_text)
 
         return OutboundMessage(
             channel=deliver_channel,

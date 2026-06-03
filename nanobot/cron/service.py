@@ -7,7 +7,7 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Literal
 
@@ -81,6 +81,7 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         max_sleep_ms: int = 300_000,  # 5 minutes
+        task_log_dir: Path | None = None,
     ):
         self.store_path = store_path
         self._action_path = store_path.parent / "action.jsonl"
@@ -91,6 +92,12 @@ class CronService:
         self._running = False
         self._timer_active = False
         self.max_sleep_ms = max_sleep_ms
+        # Optional safety-net target for failure tombstones. When set, a
+        # ``record_subagent_result`` call with status="failed" appends a
+        # short stanza to ``<task_log_dir>/<UTC-date>.md`` so the day's log
+        # has a record of the attempt even though the subagent never got
+        # the chance to write its own success entry.
+        self.task_log_dir = task_log_dir
 
     def _load_jobs(self) -> tuple[list[CronJob], int] | None:
         """Load jobs from disk.
@@ -470,6 +477,95 @@ class CronService:
             with open(self._action_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"action": action, "params": params}, ensure_ascii=False) + "\n")
 
+    def record_subagent_result(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+    ) -> None:
+        """Backwrite a cron subagent's real outcome into the job's state.
+
+        ``_execute_job`` marks ``last_status = "ok"`` the moment ``on_job``
+        returns — but for ``agent_turn`` jobs ``on_job`` only spawns the
+        subagent and returns within a handful of milliseconds (see the
+        ``durationMs: 14``-style entries in ``runHistory``).  The subagent
+        then runs asynchronously, and the cron service never hears back
+        about whether it actually succeeded.  Result: ``cron list`` reports
+        every run as OK forever, even when the subagent crashed five
+        minutes in.
+
+        Call this from the cron-result handler with the subagent's real
+        terminal status so ``last_status`` / ``last_error`` /
+        ``run_history[-1]`` reflect what actually happened.  When
+        ``status`` indicates failure and ``task_log_dir`` is configured,
+        also drop a short stanza into today's task_log so the daily
+        record isn't silently empty.
+
+        Unknown job ids are a no-op (the job may have been deleted between
+        spawn and result delivery).
+        """
+        store = self._load_store()
+        if not store:
+            return
+        job = next((j for j in store.jobs if j.id == job_id), None)
+        if not job:
+            return
+
+        real_status: Literal["ok", "error"] = (
+            "ok" if status == "completed" else "error"
+        )
+        job.state.last_status = real_status
+        job.state.last_error = error if real_status == "error" else None
+
+        # Overwrite the placeholder spawn-time entry in run_history rather
+        # than appending — there was one run, not two.  Also fix the
+        # duration which was previously the spawn dispatch time (~ms).
+        if job.state.run_history:
+            last = job.state.run_history[-1]
+            last.status = real_status
+            last.error = error if real_status == "error" else None
+            if job.state.last_run_at_ms:
+                last.duration_ms = max(0, _now_ms() - job.state.last_run_at_ms)
+
+        self._save_store()
+
+        if real_status == "error" and self.task_log_dir is not None:
+            self._write_failure_tombstone(job, error or "")
+
+    def _write_failure_tombstone(self, job: CronJob, error: str) -> None:
+        """Append a short failure stanza to today's UTC task_log file.
+
+        The success path expects the cron subagent to call ``write_file``
+        with the day's results — and the prompt-driven write does happen,
+        when the subagent reaches that step.  When it dies earlier the
+        day's log silently misses the attempt.  This stanza is the safety
+        net so failed runs are still visible (and so the next morning's
+        bot can answer "what did cron do last night" honestly).
+        """
+        try:
+            self.task_log_dir.mkdir(parents=True, exist_ok=True)
+            now_utc = datetime.now(timezone.utc)
+            path = self.task_log_dir / f"{now_utc.strftime('%Y-%m-%d')}.md"
+            stamp = now_utc.strftime("%H:%M:%S UTC")
+            clean_error = (error or "").strip() or "(no error message captured)"
+            # Bound the tombstone — a runaway subagent stacktrace could be
+            # huge and we only want a tombstone, not the whole post-mortem.
+            if len(clean_error) > 1000:
+                clean_error = clean_error[:1000].rstrip() + "…"
+            stanza = (
+                f"\n## Cron Failure — `{job.name}` @ {stamp}\n"
+                "\n"
+                f"- Job ID: `{job.id}`\n"
+                f"- Error / last words: {clean_error}\n"
+            )
+            with path.open("a", encoding="utf-8") as f:
+                f.write(stanza)
+        except OSError:
+            logger.exception(
+                "Failed to write cron failure tombstone for job '{}' ({})",
+                job.name, job.id,
+            )
 
     # ========== Public API ==========
 

@@ -1889,6 +1889,27 @@ class AgentLoop:
             deliver_channel, deliver_chat_id,
         )
 
+        # Backwrite the real subagent outcome into cron state so ``cron list``
+        # (and the LLM consuming it) sees the truth instead of the spawn-time
+        # placeholder.  On failure this also leaves a tombstone in today's
+        # task_log so the daily record isn't silently empty.  Runs regardless
+        # of whether we end up notifying the user — state truth and delivery
+        # are independent concerns.
+        if job_id and self.cron_service is not None:
+            error_text = (
+                subagent_result.strip() or None
+                if subagent_status != "completed"
+                else None
+            )
+            try:
+                self.cron_service.record_subagent_result(
+                    job_id, subagent_status, error=error_text,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to backwrite cron state for job {}", job_id,
+                )
+
         if not deliver_enabled:
             # Job was scheduled with deliver=False — never notify the user.
             return None

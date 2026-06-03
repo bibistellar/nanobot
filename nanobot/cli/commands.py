@@ -932,9 +932,14 @@ def _run_gateway(
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
 
-    # Create cron service with workspace-scoped store
+    # Create cron service with workspace-scoped store. ``task_log_dir``
+    # is the safety-net target for failure tombstones (see
+    # ``CronService.record_subagent_result``); it must point at the same
+    # ``memory/task_log/<YYYY-MM-DD>.md`` directory the agent prompt tells
+    # successful subagents to write.
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
+    cron_task_log_dir = config.workspace_path / "memory" / "task_log"
+    cron = CronService(cron_store_path, task_log_dir=cron_task_log_dir)
 
     # Create agent with cron service
     agent = AgentLoop.from_config(
@@ -1291,9 +1296,11 @@ def agent(
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
 
-    # Create cron service with workspace-scoped store
+    # Create cron service with workspace-scoped store. See the matching
+    # gateway-entry comment above for why ``task_log_dir`` is wired here.
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
+    cron_task_log_dir = config.workspace_path / "memory" / "task_log"
+    cron = CronService(cron_store_path, task_log_dir=cron_task_log_dir)
 
     if logs:
         logger.enable("nanobot")

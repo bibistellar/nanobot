@@ -83,14 +83,24 @@ class ContextBuilder:
         self.system_to_user_models = system_to_user_models or []
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
-    def build_system_prompt(
+    def build_static_prompt_parts(
         self,
-        skill_names: list[str] | None = None,
-        channel: str | None = None,
-        session_summary: str | None = None,
+        *,
         workspace: Path | None = None,
-    ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        channel: str | None = None,
+    ) -> list[str]:
+        """Identity-defining prompt sections shared between main agent and subagents.
+
+        Carved out of ``build_system_prompt`` so subagents can reuse the
+        same identity layer (identity / bootstrap files / tool contract /
+        memory rules / always-skill full text / skills index) instead of
+        having to operate on a stripped-down "you are a subagent" stub.
+
+        Excludes the per-session sections (recent history, archived
+        summary) that only make sense for the main agent's stateful turns;
+        subagents run in isolated sessions and pulling main-agent history
+        would defeat the point of running them in parallel.
+        """
         root = workspace or self.workspace
         parts = [self._get_identity(channel=channel, workspace=root)]
 
@@ -125,6 +135,40 @@ class ContextBuilder:
         skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+
+        return parts
+
+    def fetch_ltm_block(self, query: str | None) -> str:
+        """Look up Dashscope long-term memories relevant to ``query`` and
+        wrap them in ``[Long-term Memory]`` tags.
+
+        Carved out of ``build_messages`` so subagents can run the same
+        retrieval on their task text without duplicating the failure-
+        tolerant call pattern.  Returns an empty string when LTM is not
+        configured, the query is empty, the store returns nothing, or
+        any error occurs (matches the silent-fallback semantics of the
+        main agent path).
+        """
+        if not self.dashscope or not query:
+            return ""
+        try:
+            ltm = self.dashscope.search_memory(query=query)
+        except Exception:
+            return ""
+        if not ltm:
+            return ""
+        return f"\n[Long-term Memory]\n{ltm}\n[/Long-term Memory]\n"
+
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        channel: str | None = None,
+        session_summary: str | None = None,
+        workspace: Path | None = None,
+    ) -> str:
+        """Build the main agent's system prompt: shared static parts plus
+        per-session bits (recent history + archived summary)."""
+        parts = self.build_static_prompt_parts(workspace=workspace, channel=channel)
 
         entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
         if entries:
@@ -292,14 +336,9 @@ class ContextBuilder:
 
         # Retrieve long-term memories relevant to the current message
         # (fork feature: shared Dashscope long-term memory across sessions).
-        ltm_block = ""
-        if self.dashscope and current_message:
-            try:
-                ltm = self.dashscope.search_memory(query=current_message)
-                if ltm:
-                    ltm_block = f"\n[Long-term Memory]\n{ltm}\n[/Long-term Memory]\n"
-            except Exception:
-                pass
+        # SubagentManager.spawn calls the same helper with the task text so
+        # the LTM injection stays in lockstep between main agent and subagent.
+        ltm_block = self.fetch_ltm_block(current_message)
 
         # Supplemental runtime lines: sustained-goal state plus
         # caller-provided lines, surfaced inside the runtime-context block.

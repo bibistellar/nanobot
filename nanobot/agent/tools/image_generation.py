@@ -72,6 +72,7 @@ class ImageGenerationToolConfig(Base):
 class ImageGenerationTool(Tool):
     """Generate persistent image artifacts through the configured image provider."""
 
+    _scopes = {"core", "subagent"}
     config_key = "image_generation"
 
     @classmethod

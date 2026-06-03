@@ -21,6 +21,7 @@ from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 class SessionsTool(Tool):
     """List the chats/sessions the bot takes part in, for cross-session actions."""
 
+    _scopes = {"core", "subagent"}
     # Internal/ephemeral session keys to hide from the roster.
     _SKIP_PREFIXES = ("cron", "unified:")
 

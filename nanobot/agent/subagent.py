@@ -16,6 +16,7 @@ from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates
 from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.self import MyTool
 from nanobot.security.workspace_access import (
     WorkspaceScope,
     bind_workspace_scope,
@@ -27,6 +28,14 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.utils.prompt_templates import render_template
+
+# `ContextBuilder` is only used at typing time; importing it eagerly would
+# create a cycle because context.py already imports SubagentManager-adjacent
+# helpers transitively.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nanobot.agent.context import ContextBuilder
 
 
 @dataclass(slots=True)
@@ -87,6 +96,8 @@ class SubagentManager:
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
+        context_builder: "ContextBuilder | None" = None,
+        runtime_state: Any | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -109,15 +120,34 @@ class SubagentManager:
         )
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
+        # ``context_builder`` and ``runtime_state`` keep subagents in lockstep
+        # with the main agent's identity layer: the same ContextBuilder is
+        # reused to produce the static prompt parts (bootstrap files, always-
+        # skill text, memory rules, tool contract) and to retrieve LTM blocks
+        # for the task text, and ``runtime_state`` is the main AgentLoop
+        # instance that the read-only ``my`` tool needs to inspect.  Both
+        # default to ``None`` so bare unit tests can still construct a
+        # SubagentManager without dragging in the full agent stack — the code
+        # falls back to the legacy ``subagent_system.md`` lite template in
+        # that case.
+        self.context_builder = context_builder
+        self.runtime_state = runtime_state
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
     def _subagent_tools_config(self) -> ToolsConfig:
-        """Build a ToolsConfig scoped for subagent use."""
+        """Build a ToolsConfig scoped for subagent use.
+
+        Propagates the main agent's ``my`` config so a deployment that has
+        explicitly disabled ``my`` is honored on the subagent side too.
+        The actual MyTool instance the subagent registers is forced into
+        read-only mode in ``_build_tools`` regardless of ``my.allow_set``.
+        """
         return ToolsConfig(
             exec=self.tools_config.exec,
             web=self.tools_config.web,
+            my=self.tools_config.my,
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
@@ -145,6 +175,20 @@ class SubagentManager:
             ),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
+        # ``my`` is registered manually because it carries a non-discoverable
+        # back-reference to the main AgentLoop (its runtime state).  We give
+        # the subagent a READ-ONLY variant — it can ``check`` the same
+        # configuration the main agent sees, but cannot mutate model /
+        # iteration limits / scratchpad (that would let one parallel branch
+        # silently rewrite the main agent's settings).
+        if (
+            self.runtime_state is not None
+            and cfg.my.enable
+            and not registry.has("my")
+        ):
+            registry.register(
+                MyTool(runtime_state=self.runtime_state, modify_allowed=False)
+            )
         return registry
 
     def set_provider(self, provider: LLMProvider, model: str) -> None:
@@ -253,9 +297,21 @@ class SubagentManager:
             for tool_name in disabled_tools or ():
                 tools.unregister(tool_name)
             system_prompt = self._build_subagent_prompt(workspace=root)
+            # Mirror the main agent: prepend any Dashscope LTM hits that
+            # match the task text.  Without this the subagent would lose
+            # all "institutional knowledge" (deploy workflow, known proxy
+            # quirks, prior incident notes) that the main agent gets for
+            # free on every turn.  ``fetch_ltm_block`` already swallows
+            # errors and returns "" on no-result / missing config.
+            ltm_block = (
+                self.context_builder.fetch_ltm_block(task)
+                if self.context_builder is not None
+                else ""
+            )
+            user_content = f"{ltm_block}{task}" if ltm_block else task
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
+                {"role": "user", "content": user_content},
             ]
 
             sess_key = origin.get("session_key")
@@ -412,12 +468,41 @@ class SubagentManager:
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
     def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
-        """Build a focused system prompt for the subagent."""
+        """Build a subagent system prompt aligned with the main agent's
+        identity layer.
+
+        When a ``ContextBuilder`` is wired in (production path: AgentLoop
+        passes ``self.context``), the prompt is the main agent's static
+        identity stack — identity / bootstrap files (AGENTS / SOUL /
+        USER) / tool contract / memory rules / always-skill **full text** /
+        skills index — prefixed with a short subagent preamble explaining
+        the scope/recursion/read-only-my caveats.  This keeps subagents
+        consistent with the main agent's knowledge ("the cluster-ops
+        repo is bibistellar/_k3s" used to live only in the always-skill
+        text the subagent never saw; now it does).
+
+        When no ContextBuilder is available (bare unit-test construction),
+        falls back to the legacy ``subagent_system.md`` lite template so
+        existing tests don't need to bring up the full agent stack.
+        """
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
 
-        time_ctx = ContextBuilder._build_runtime_context(None, None)
         root = workspace or self.workspace
+        time_ctx = ContextBuilder._build_runtime_context(None, None)
+
+        if self.context_builder is not None:
+            preamble = render_template(
+                "agent/subagent_preamble.md",
+                time_ctx=time_ctx,
+                workspace=str(root),
+            )
+            static_parts = self.context_builder.build_static_prompt_parts(
+                workspace=root,
+            )
+            return "\n\n---\n\n".join([preamble, *static_parts])
+
+        # Legacy fallback path — no ContextBuilder available.
         skills_summary = SkillsLoader(
             root,
             disabled_skills=self.disabled_skills,

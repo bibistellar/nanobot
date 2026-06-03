@@ -327,6 +327,13 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
+            # Share the main agent's ContextBuilder so subagents see the
+            # same identity layer (always-skill full text, bootstrap files,
+            # memory rules, LTM retrieval) instead of a stripped-down
+            # "you are a subagent" stub. ``runtime_state=self`` powers the
+            # read-only ``my`` tool the subagent registry now carries.
+            context_builder=self.context,
+            runtime_state=self,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120

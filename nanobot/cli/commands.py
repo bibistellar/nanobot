@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
@@ -892,6 +893,110 @@ def desktop_gateway(
     )
 
 
+_LOG_RETENTION_DAYS = 14
+
+
+def _prune_stale_gateway_logs(log_dir: Path, *, retention_days: int = _LOG_RETENTION_DAYS) -> None:
+    """Delete ``gateway-YYYY-MM-DD.log`` files older than the retention window.
+
+    The on-disk sink writes one file per UTC day with the date baked into
+    the filename, so retention is just "delete files whose date stamp is
+    older than today minus N days".  Best-effort: malformed filenames and
+    unlink errors are silently ignored — the worst case is a stale file
+    that grows until the next startup tries again.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=retention_days)
+    try:
+        candidates = list(log_dir.glob("gateway-*.log"))
+    except OSError:
+        return
+    for path in candidates:
+        try:
+            stamp = path.stem.removeprefix("gateway-")
+            file_date = datetime.strptime(stamp, "%Y-%m-%d").date()
+        except (ValueError, AttributeError):
+            continue
+        if file_date < cutoff:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _add_agent_visible_log_sink(workspace_path: Path) -> int:
+    """Add a JSONL log sink under ``<workspace>/logs/``.
+
+    Returns the loguru handler id (for tests / shutdown so the specific
+    sink can be removed without nuking ``stderr`` along with it).
+
+    The agent reads its own runtime logs via ``read_file`` / ``grep`` /
+    ``exec tail``.
+
+    Without this the only log destination is ``stderr`` → kubelet →
+    ``kubectl logs``, which the agent process itself cannot read.  That
+    blind spot meant the bot could never answer "why did my last cron
+    fail?" without guessing — see today's cluster-health-check incident.
+
+    Layout (mirrors what OpenClaw does, since it works well for agents):
+
+    - One file per UTC day: ``logs/gateway-YYYY-MM-DD.log``
+    - JSON Lines format (each line a self-contained JSON object) so the
+      agent can grep ``'"level":"ERROR"'`` instead of fighting ANSI codes.
+    - Retention: stale ``gateway-*.log`` files older than 14 days are
+      pruned at startup (loguru's built-in rotation/retention can't be
+      used with custom-callable sinks; we manage filenames ourselves).
+    - ``enqueue=True`` so the write thread can't block the main async loop.
+    - Secrets (Bearer tokens, basic-auth credentials, JSON ``token``/
+      ``api_key`` fields, common provider key prefixes) are run through
+      ``redact_text`` before write.  ``stderr`` keeps the unredacted
+      stream — anyone with ``kubectl logs`` access already has the pod.
+    """
+    from datetime import datetime, timezone
+
+    from nanobot.utils.log_redact import redact_text
+
+    log_dir = workspace_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _prune_stale_gateway_logs(log_dir)
+
+    def _file_sink(message: object) -> None:
+        # ``loguru.Message`` exposes ``.record`` dict; we build a slim
+        # JSON object instead of using ``serialize=True`` (which dumps the
+        # whole record with internal fields the agent doesn't need).
+        record = message.record  # type: ignore[attr-defined]
+        payload = {
+            "time": record["time"].isoformat(),
+            "level": record["level"].name,
+            "channel": record["extra"].get("channel", "-"),
+            "logger": (
+                f"{record['name']}:{record['function']}:{record['line']}"
+            ),
+            "message": redact_text(record["message"]),
+        }
+        if record.get("exception"):
+            payload["exception"] = redact_text(str(record["exception"]))
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        today_path = log_dir / (
+            "gateway-" + datetime.now(timezone.utc).strftime("%Y-%m-%d") + ".log"
+        )
+        try:
+            with today_path.open("a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            # Best-effort — a transient disk error must not crash the
+            # agent loop. The stderr sink still has the message.
+            pass
+
+    return logger.add(
+        _file_sink,
+        level="INFO",
+        enqueue=True,
+        filter=lambda record: record["extra"].setdefault("channel", "-") or True,
+    )
+
+
 def _run_gateway(
     config: Config,
     *,
@@ -918,6 +1023,7 @@ def _run_gateway(
     port = port if port is not None else config.gateway.port
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    _add_agent_visible_log_sink(config.workspace_path)
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     runtime_events = RuntimeEventBus()

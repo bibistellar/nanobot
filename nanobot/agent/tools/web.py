@@ -356,7 +356,7 @@ class WebSearchTool(Tool):
                         "https://api.search.brave.com/res/v1/web/search",
                         params={"q": query, "count": n},
                         headers=headers,
-                        timeout=10.0,
+                        timeout=float(self.config.timeout),
                     )
                     if r.status_code != 429:
                         break
@@ -390,7 +390,7 @@ class WebSearchTool(Tool):
                     "https://api.tavily.com/search",
                     headers={"Authorization": f"Bearer {api_key}", "User-Agent": self.user_agent},
                     json={"query": query, "max_results": n},
-                    timeout=15.0,
+                    timeout=float(self.config.timeout),
                 )
                 r.raise_for_status()
             return _format_results(query, r.json().get("results", []), n)
@@ -412,7 +412,7 @@ class WebSearchTool(Tool):
                     endpoint,
                     params={"q": query, "format": "json"},
                     headers={"User-Agent": self.user_agent},
-                    timeout=10.0,
+                    timeout=float(self.config.timeout),
                 )
                 r.raise_for_status()
             return _format_results(query, r.json().get("results", []), n)
@@ -435,7 +435,7 @@ class WebSearchTool(Tool):
                 r = await client.get(
                     f"https://s.jina.ai/{encoded_query}",
                     headers=headers,
-                    timeout=15.0,
+                    timeout=float(self.config.timeout),
                 )
                 r.raise_for_status()
             data = r.json().get("data", [])[:n]
@@ -459,7 +459,7 @@ class WebSearchTool(Tool):
                     "https://kagi.com/api/v1/search",
                     json={"query": query, "limit": n},
                     headers={"Authorization": f"Bearer {api_key}", "User-Agent": self.user_agent},
-                    timeout=10.0,
+                    timeout=float(self.config.timeout),
                 )
                 r.raise_for_status()
             items = [
@@ -476,7 +476,7 @@ class WebSearchTool(Tool):
             # We run it in a thread to avoid blocking the loop
             from ddgs import DDGS
 
-            ddgs = DDGS(timeout=10)
+            ddgs = DDGS(timeout=int(self.config.timeout))
             raw = await asyncio.wait_for(
                 asyncio.to_thread(ddgs.text, query, max_results=n),
                 timeout=self.config.timeout,

@@ -63,10 +63,20 @@ class _SubagentHook(AgentHook):
         self._status = status
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
+        # ``logger.info`` (not debug) so the agent-visible log file under
+        # ``logs/gateway-YYYY-MM-DD.log`` captures every subagent tool call
+        # the same way the main agent's progress_hook does.  Without this,
+        # when a cron subagent dies we have no record of *which* tool call
+        # killed it — and bot self-introspection (read its own log) can't
+        # answer "why did the subagent fail".  (Today's image-upgrade-check
+        # `Grep` failure was visible from the cron-result error message,
+        # but ``cluster-health-check`` died inside a string of tool calls
+        # we couldn't see at all.)  Args are JSON-redacted by the file
+        # sink's redact_text pass before they hit disk.
         for tool_call in context.tool_calls:
             args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-            logger.debug(
-                "Subagent [{}] executing: {} with arguments: {}",
+            logger.info(
+                "Subagent [{}] tool call: {}({})",
                 self._task_id, tool_call.name, args_str,
             )
 
@@ -332,7 +342,18 @@ class SubagentManager:
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task completed but no final response was generated.",
                     error_message=None,
-                    fail_on_tool_error=True,
+                    # Mirror the main agent: tool errors come back to the LLM
+                    # as a tool result so it can retry/correct on the next
+                    # iteration, instead of one stray PascalCase tool name
+                    # (``Grep`` vs ``grep`` — Claude 4.x training preference)
+                    # killing the whole subagent.  ``max_iterations`` (default
+                    # 200) and the wall-clock LLM timeout still bound the run,
+                    # so a runaway error loop can't go infinite.  Previously
+                    # ``fail_on_tool_error=True`` was inherited from the early
+                    # subagent extraction (commit e7d371ec) with no deliberate
+                    # rationale; the resulting "zero tolerance" surface meant
+                    # cron subagents had no chance to self-correct.
+                    fail_on_tool_error=False,
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     workspace=root,

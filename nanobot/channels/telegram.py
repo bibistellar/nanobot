@@ -387,11 +387,18 @@ class TelegramChannel(BaseChannel):
         proxy = self.config.proxy or None
 
         # Separate pools so long-polling (getUpdates) never starves outbound sends.
+        # ``write_timeout`` defaults to ~5s in python-telegram-bot's HTTPXRequest;
+        # send_photo / send_video upload the file body in the request, so a 1MB+
+        # PNG routed through mihomo regularly exceeds that and TimedOut's silently.
+        # Match read_timeout so the proxy-uploaded media path has the same budget
+        # as the response-read path (and the deployment-side ``sed`` patch that
+        # raises read/connect to 120s sees write_timeout and lifts it identically).
         api_request = HTTPXRequest(
             connection_pool_size=self.config.connection_pool_size,
             pool_timeout=self.config.pool_timeout,
             connect_timeout=30.0,
             read_timeout=30.0,
+            write_timeout=30.0,
             proxy=proxy,
         )
         poll_request = HTTPXRequest(
@@ -399,6 +406,7 @@ class TelegramChannel(BaseChannel):
             pool_timeout=self.config.pool_timeout,
             connect_timeout=30.0,
             read_timeout=30.0,
+            write_timeout=30.0,
             proxy=proxy,
         )
         builder = (

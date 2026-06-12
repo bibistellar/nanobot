@@ -67,6 +67,15 @@ from nanobot.utils.log_redact import redact_text
             "ghp_1234567890abcdefghijABCDEF12345678",
             "ghp_***",
         ),
+        # GitHub OAuth user-to-server token raw — what `gh auth login`
+        # issues and what cluster-ops cron jobs use in basic-auth headers.
+        # See bibistellar/nanobot#5 for the production leak that prompted
+        # adding this pattern.
+        (
+            "curl -u bibistellar:gho_AbCdEfGh1234567890IjKlMnOpQrStUvWxYz",
+            "gho_AbCdEfGh1234567890IjKlMnOpQrStUvWxYz",
+            "gho_***",
+        ),
         # Slack bot token raw.
         (
             "Slack webhook xoxb-1234567890-abcdefghijklm",

@@ -73,6 +73,12 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "sk-" + _MASK),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_" + _MASK),
     (re.compile(r"ghs_[A-Za-z0-9]{20,}"), "ghs_" + _MASK),
+    # ``gho_`` is GitHub's OAuth user-to-server prefix (what ``gh auth login``
+    # issues for a personal account, and what cluster-ops uses in basic-auth
+    # ``-u user:gho_…`` calls). Adding it here closes the 2026-06-11 leak
+    # captured in bibistellar/nanobot#5 where logs/gateway-2026-06-11.log held
+    # a full OAuth token unredacted because this prefix was missing.
+    (re.compile(r"gho_[A-Za-z0-9]{20,}"), "gho_" + _MASK),
     (re.compile(r"xox[bpars]-[A-Za-z0-9\-]{10,}"), "xox-" + _MASK),
 )
 

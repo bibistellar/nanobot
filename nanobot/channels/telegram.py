@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+import httpx
 from pydantic import Field, field_validator, model_validator
 from telegram import (
     BotCommand,
@@ -402,13 +403,32 @@ class TelegramChannel(BaseChannel):
         # Separate pools so long-polling (getUpdates) never starves outbound
         # sends. All three timeouts come from TelegramConfig so deployments
         # can tune them without the sed hack that bug #4 documented.
+        #
+        # ``local_address="0.0.0.0"`` forces every connection through an IPv4
+        # socket. Without this, async httpx's happy-eyeballs picks up the
+        # ``2001:67c:4e8:f004::9`` AAAA record api.telegram.org publishes and
+        # then deadlocks on the IPv6 leg whenever the upstream network has no
+        # IPv6 route — which is exactly what the fork's Malaysia node looks
+        # like (sync httpx + curl -4 both succeed in <1s, async http1 without
+        # this hint failed 2/3 of the time with ConnectTimeout after 10s).
+        # Empirically this is what lets us drop the mihomo proxy from
+        # ``channels.telegram.proxy`` and go direct without a regression.
+        # The transport also carries the proxy so PTB's own ``proxy`` kwarg
+        # is set to None — when both are present httpx ignores the client
+        # proxy in favor of the transport's, which is what we want.
+        def _make_transport():
+            return httpx.AsyncHTTPTransport(
+                local_address="0.0.0.0",
+                proxy=proxy,
+            )
+
         api_request = HTTPXRequest(
             connection_pool_size=self.config.connection_pool_size,
             pool_timeout=self.config.pool_timeout,
             connect_timeout=self.config.connect_timeout,
             read_timeout=self.config.read_timeout,
             write_timeout=self.config.write_timeout,
-            proxy=proxy,
+            httpx_kwargs={"transport": _make_transport(), "proxy": None},
         )
         poll_request = HTTPXRequest(
             connection_pool_size=4,
@@ -416,7 +436,7 @@ class TelegramChannel(BaseChannel):
             connect_timeout=self.config.connect_timeout,
             read_timeout=self.config.read_timeout,
             write_timeout=self.config.write_timeout,
-            proxy=proxy,
+            httpx_kwargs={"transport": _make_transport(), "proxy": None},
         )
         builder = (
             Application.builder()

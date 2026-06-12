@@ -1237,8 +1237,26 @@ def _run_gateway(
         console.print("[yellow]✗[/yellow] Heartbeat: disabled")
 
     async def _health_server(host: str, health_port: int):
-        """Lightweight HTTP health endpoint on the gateway port."""
+        """Lightweight HTTP health endpoint on the gateway port.
+
+        Returns 200 with per-probe ages when every registered liveness
+        probe (event loop, Telegram polling keepalive, …) has beaten
+        recently; returns 503 the moment one goes stale, which the
+        Kubernetes ``livenessProbe`` interprets as "restart this pod".
+        Without this the gateway could be silently dead for hours while
+        ``/health`` cheerfully returned 200 (see issues #2 / #6).
+        """
         import json as _json
+
+        from nanobot.health import liveness as _liveness
+
+        # Probes that always exist:
+        # - http_server: any successful /health request proves the HTTP loop
+        #   is alive (used to be ALL we checked, hence the silent failures).
+        # - event_loop: a background task beats this every 5s. If the asyncio
+        #   loop deadlocks (LLM-error recovery, etc.), this goes stale.
+        _liveness.register_probe("http_server", grace_period_s=30.0, stale_after_s=60.0)
+        _liveness.register_probe("event_loop", grace_period_s=30.0, stale_after_s=30.0)
 
         async def handle(reader, writer):
             try:
@@ -1254,9 +1272,18 @@ def _run_gateway(
                 method, path = parts[0], parts[1]
 
             if method == "GET" and path == "/health":
-                body = _json.dumps({"status": "ok"})
+                _liveness.beat("http_server")
+                healthy, ages = _liveness.evaluate()
+                body = _json.dumps({
+                    "status": "ok" if healthy else "degraded",
+                    "probes": {n: round(a, 1) for n, a in ages.items()},
+                })
+                status_line = (
+                    "HTTP/1.0 200 OK" if healthy
+                    else "HTTP/1.0 503 Service Unavailable"
+                )
                 resp = (
-                    f"HTTP/1.0 200 OK\r\n"
+                    f"{status_line}\r\n"
                     f"Content-Type: application/json\r\n"
                     f"Content-Length: {len(body)}\r\n"
                     f"\r\n{body}"
@@ -1278,6 +1305,19 @@ def _run_gateway(
         console.print(f"[green]✓[/green] Health endpoint: http://{host}:{health_port}/health")
         async with server:
             await server.serve_forever()
+
+    async def _event_loop_heartbeat():
+        """Background heartbeat task — proves the asyncio loop is yielding.
+
+        If the main agent's LLM-recovery path deadlocks (see issue #2), this
+        coroutine stops being scheduled and the ``event_loop`` probe goes
+        stale → ``/health`` 503 → Kubernetes restarts the pod.
+        """
+        from nanobot.health import liveness as _liveness
+
+        while True:
+            _liveness.beat("event_loop")
+            await asyncio.sleep(5)
     # Register Dream system job (idempotent on restart)
     dream_cfg = config.agents.defaults.dream
     if dream_cfg.model_override:
@@ -1347,6 +1387,10 @@ def _run_gateway(
             ]
             if health_server_enabled:
                 tasks.append(_health_server(config.gateway.host, port))
+                # Always pair the health server with the event-loop heartbeat:
+                # the ``event_loop`` probe is meaningless without something
+                # beating it on a schedule.
+                tasks.append(_event_loop_heartbeat())
             if open_browser_url:
                 tasks.append(_open_browser_when_ready())
             await asyncio.gather(*tasks)

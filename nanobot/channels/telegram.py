@@ -522,8 +522,27 @@ class TelegramChannel(BaseChannel):
                 error_callback=self._on_polling_error,
             )
 
+        # Register a liveness probe so /health (and Kubernetes' livenessProbe)
+        # can detect when this coroutine stops yielding — the symptom of the
+        # 2026-06-10 / 2026-06-12 deadlocks where the gateway went silent for
+        # hours while ``/health`` happily returned 200. See issue #2.
+        # Note: this is a *coroutine-level* liveness check. If the outer
+        # keepalive below stops running, the probe goes stale and the pod
+        # gets restarted. It does NOT catch the case where the keepalive
+        # keeps yielding but PTB's internal polling task has died — that
+        # would require hooking deeper into python-telegram-bot. Useful
+        # proxy in practice because the two failure modes have so far
+        # come together.
+        from nanobot.health import liveness as _liveness
+        _liveness.register_probe(
+            "telegram_polling",
+            grace_period_s=30.0,
+            stale_after_s=30.0,
+        )
+
         # Keep running until stopped
         while self._running:
+            _liveness.beat("telegram_polling")
             await asyncio.sleep(1)
 
     async def stop(self) -> None:

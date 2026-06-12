@@ -249,6 +249,19 @@ class TelegramConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
+    # Per-request timeouts for the HTTPXRequest the bot uses to talk to Telegram.
+    # ``connect_timeout`` and ``read_timeout`` default at 30s used to be patched
+    # in production via a deployment-side ``sed -i`` against site-packages
+    # (which silently failed as Permission denied for ~4 months, see #4).
+    # Promoting them to config so the values are visible, documented, and
+    # don't require a brittle string-replace hack to override.
+    connect_timeout: float = 30.0
+    read_timeout: float = 30.0
+    # ``write_timeout`` matters for ``send_photo`` / ``send_video`` because the
+    # file body uploads through the *write* phase, not read. python-telegram-bot's
+    # default of ~5s is well under the actual ~10s a 1MB upload through mihomo
+    # needs, so leaving it default was silently failing media sends until 2026-06-11.
+    write_timeout: float = 30.0
     streaming: bool = True
     # Enable inline keyboard buttons in Telegram messages.
     inline_keyboards: bool = False
@@ -386,27 +399,23 @@ class TelegramChannel(BaseChannel):
 
         proxy = self.config.proxy or None
 
-        # Separate pools so long-polling (getUpdates) never starves outbound sends.
-        # ``write_timeout`` defaults to ~5s in python-telegram-bot's HTTPXRequest;
-        # send_photo / send_video upload the file body in the request, so a 1MB+
-        # PNG routed through mihomo regularly exceeds that and TimedOut's silently.
-        # Match read_timeout so the proxy-uploaded media path has the same budget
-        # as the response-read path (and the deployment-side ``sed`` patch that
-        # raises read/connect to 120s sees write_timeout and lifts it identically).
+        # Separate pools so long-polling (getUpdates) never starves outbound
+        # sends. All three timeouts come from TelegramConfig so deployments
+        # can tune them without the sed hack that bug #4 documented.
         api_request = HTTPXRequest(
             connection_pool_size=self.config.connection_pool_size,
             pool_timeout=self.config.pool_timeout,
-            connect_timeout=30.0,
-            read_timeout=30.0,
-            write_timeout=30.0,
+            connect_timeout=self.config.connect_timeout,
+            read_timeout=self.config.read_timeout,
+            write_timeout=self.config.write_timeout,
             proxy=proxy,
         )
         poll_request = HTTPXRequest(
             connection_pool_size=4,
             pool_timeout=self.config.pool_timeout,
-            connect_timeout=30.0,
-            read_timeout=30.0,
-            write_timeout=30.0,
+            connect_timeout=self.config.connect_timeout,
+            read_timeout=self.config.read_timeout,
+            write_timeout=self.config.write_timeout,
             proxy=proxy,
         )
         builder = (

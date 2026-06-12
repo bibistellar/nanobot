@@ -712,19 +712,28 @@ class TelegramChannel(BaseChannel):
                 )
 
     async def _call_with_retry(self, fn, *args, **kwargs):
-        """Call an async Telegram API function with retry on pool/network timeout and RetryAfter."""
+        """Call an async Telegram API function with retry on transient
+        network errors and RetryAfter.
+
+        TimedOut and NetworkError are both subclasses of telegram.error's
+        network family; httpx.ReadError / ConnectError / RemoteProtocolError
+        get wrapped into NetworkError, which is exactly what a mihomo egress
+        wobble surfaces as. Without retrying NetworkError, a single TLS
+        reset during send_photo (typical 1-second mihomo blip) failed the
+        whole media send — see the 2026-06-12 16:07 arch_diagram.png drop.
+        """
         from telegram.error import RetryAfter
 
         for attempt in range(1, _SEND_MAX_RETRIES + 1):
             try:
                 return await fn(*args, **kwargs)
-            except TimedOut:
+            except (TimedOut, NetworkError) as exc:
                 if attempt == _SEND_MAX_RETRIES:
                     raise
                 delay = _SEND_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 self.logger.warning(
-                    "timeout (attempt {}/{}), retrying in {:.1f}s",
-                    attempt, _SEND_MAX_RETRIES, delay,
+                    "{} (attempt {}/{}), retrying in {:.1f}s",
+                    type(exc).__name__, attempt, _SEND_MAX_RETRIES, delay,
                 )
                 await asyncio.sleep(delay)
             except RetryAfter as e:

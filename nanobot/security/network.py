@@ -27,13 +27,48 @@ _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
 
 def configure_ssrf_whitelist(cidrs: list[str]) -> None:
-    """Allow specific CIDR ranges to bypass SSRF blocking (e.g. Tailscale's 100.64.0.0/10)."""
+    """Allow specific CIDR ranges to bypass SSRF blocking (e.g. Tailscale's 100.64.0.0/10).
+
+    Union semantics: this never *shrinks* the whitelist. Multiple
+    ``load_config()`` call sites (the WebUI MCP routes, the lazy
+    config_loader in web.py, the gateway entry, etc.) all reach
+    here; if any of them resolves to a Config with an empty
+    ``ssrf_whitelist`` (because, say, a schema-validation hiccup made
+    ``load_config`` fall back to ``Config()`` defaults), the empty list
+    would otherwise wipe the previously-good whitelist out from under
+    every concurrent caller. The production gateway hit exactly that
+    failure mode on 2026-06-12 — ``_allowed_networks: []`` despite the
+    config file declaring ``10.0.0.0/8`` and friends (bibistellar/nanobot#3).
+    Union-merging makes the global monotonic: once a CIDR has been
+    whitelisted in the running process, no subsequent reload can revoke
+    it without a process restart.
+    """
     global _allowed_networks
-    nets = []
+    new_nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for cidr in cidrs:
         with suppress(ValueError):
-            nets.append(ipaddress.ip_network(cidr, strict=False))
-    _allowed_networks = nets
+            new_nets.append(ipaddress.ip_network(cidr, strict=False))
+    if not new_nets:
+        # Nothing to add. Importantly, we do NOT clear the existing list.
+        return
+    existing = set(_allowed_networks)
+    merged = list(_allowed_networks)
+    for n in new_nets:
+        if n not in existing:
+            merged.append(n)
+            existing.add(n)
+    _allowed_networks = merged
+
+
+def reset_ssrf_whitelist() -> None:
+    """Clear the allowed-networks list.
+
+    Only intended for tests — production code paths must never call this.
+    ``configure_ssrf_whitelist`` deliberately won't shrink the global
+    so a stray ``Config()`` default reload can't open a SSRF window.
+    """
+    global _allowed_networks
+    _allowed_networks = []
 
 
 def _normalize_addr(

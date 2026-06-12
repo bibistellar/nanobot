@@ -18,7 +18,7 @@ from nanobot.agent.tools import (
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool, ExecToolConfig
-from nanobot.security.network import configure_ssrf_whitelist
+from nanobot.security.network import configure_ssrf_whitelist, reset_ssrf_whitelist
 
 
 class SampleTool(Tool):
@@ -252,7 +252,9 @@ def test_exec_guard_allows_whitelisted_internal_urls(tmp_path) -> None:
         )
         assert error is None
     finally:
-        configure_ssrf_whitelist([])
+        # ``configure_ssrf_whitelist([])`` no longer clears the global
+        # (issue #3 — empty list is a no-op now). Use the test-only reset.
+        reset_ssrf_whitelist()
 
 
 def test_exec_extract_absolute_paths_captures_posix_absolute_paths() -> None:
